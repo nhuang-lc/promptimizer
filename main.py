@@ -8,6 +8,7 @@ from prompt_optimizer.tasks.scone import scone_task
 from prompt_optimizer.tasks.tweet_generator import tweet_task
 from prompt_optimizer.tasks.metaprompt import metaprompt_task
 from prompt_optimizer.tasks.simpleqa import simpleqa_task
+from prompt_optimizer.tasks.ticket_classification import ticket_classification_task
 
 
 tasks = {
@@ -15,6 +16,7 @@ tasks = {
     "tweet": tweet_task,
     "metaprompt": metaprompt_task,
     "simpleqa": simpleqa_task,
+    "ticket-classification": ticket_classification_task,
 }
 
 
@@ -23,14 +25,14 @@ optimizer = PromptOptimizer(
 )
 
 
-async def run(task_name: str, batch_size: int, train_size: int, epochs: int):
+async def run(task_name: str, batch_size: int, train_size: int, epochs: int, debug: bool = False):
     task = tasks.get(task_name)
     if not task:
         raise ValueError(f"Unknown task: {task_name}")
 
     with ls.tracing_context(project_name="Optim"):
         return await optimizer.optimize_prompt(
-            task, batch_size=batch_size, train_size=train_size, epochs=epochs
+            task, batch_size=batch_size, train_size=train_size, epochs=epochs, debug=debug
         )
 
 
@@ -48,8 +50,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs", type=int, default=2, help="Number of epochs for optimization"
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable debug mode"
+    )
 
     args = parser.parse_args()
 
-    results = asyncio.run(run(args.task, args.batch_size, args.train_size, args.epochs))
+    results = asyncio.run(run(args.task, args.batch_size, args.train_size, args.epochs, args.debug))
     print(results)

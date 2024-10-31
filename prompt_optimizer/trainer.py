@@ -262,6 +262,9 @@ class PromptOptimizer:
                     progress.console.print(
                         f"New best score: {best_score:.4f} (surpassed previous best)"
                     )
+                    progress.console.print("Average of:")
+                    for metric, score in dev_scores.items():
+                        progress.console.print(f"  {metric}: {score:.4f}")
                 else:
                     other_attempts.append(current_prompt)
                     current_prompt = best_prompt

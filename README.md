@@ -37,6 +37,7 @@ Currently has ~ 4 tasks:
 - tweet: write tweets
 - simpleqa: really hard Q&A
 - scone: NLI
+- ticket-classification: classify & triage inbound support tickets
 - metaprompt: optimize the metaprompt itself over the above 3 tasks
 
 ![run](./static/optimizer.gif)

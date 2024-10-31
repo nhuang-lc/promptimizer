@@ -9,6 +9,7 @@ dependencies = [
     "langchain-openai",
     "pandas>=0.2.4",
     "rich",
+    "trustcall",
 ]
 
 [tool.setuptools]

@@ -8,6 +8,7 @@ from prompt_optimizer.trainer import (
 from prompt_optimizer.tasks.scone import scone_task
 from prompt_optimizer.tasks.tweet_generator import tweet_task
 from prompt_optimizer.tasks.simpleqa import simpleqa_task
+from prompt_optimizer.tasks.ticket_classification import ticket_classification_task
 
 
 DEFAULT_METAMETAPROMPT = """You are an expert in prompt optimization systems. Your task is to improve the effectiveness of prompt optimization prompts - the prompts used to guide the improvement of task-specific prompts.
@@ -174,6 +175,7 @@ metaprompt_task = Task(
             "scone": scone_task,
             "tweet": tweet_task,
             "simpleqa": simpleqa_task,
+            "ticket_classification_task": ticket_classification_task,
         },
         meta_prompt=DEFAULT_METAMETAPROMPT,
     ),
@@ -242,7 +244,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     client = Client()
-    tasks = ["scone", "tweet", "simpleqa"]
+    tasks = ["scone", "tweet", "simpleqa", "ticket_classification_task"]
 
     datasets = create_datasets(client, tasks, args.batchsize, args.overwrite)
 
