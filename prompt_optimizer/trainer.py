@@ -2,7 +2,7 @@ import random
 from collections import defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 from uuid import UUID
 
 import langsmith as ls
@@ -151,6 +151,7 @@ class PromptOptimizer:
         train_size: Optional[int] = None,
         batch_size: int = 40,
         epochs: int = 1,
+        use_annotation_queue: str | None = None,
         debug: bool = False,
     ) -> tuple[str, float]:
         """Optimizes a prompt for a specific task through multiple iterations."""
@@ -186,7 +187,11 @@ class PromptOptimizer:
                 baseline_scores = await self.calculate_scores(
                     baseline_experiment_results
                 )
-            best_score = sum(baseline_scores.values()) / len(baseline_scores)
+            best_score = (
+                sum(baseline_scores.values()) / len(baseline_scores)
+                if baseline_scores
+                else None
+            )
             baseline_scores_output = "[cyan]Baseline scores:\n"
             for metric, score in baseline_scores.items():
                 baseline_scores_output += f"  {metric}: {score:.4f}\n"
@@ -216,12 +221,29 @@ class PromptOptimizer:
                     f"[yellow]Epoch {epoch+1} batches", total=len(batches)
                 )
                 all_train_scores = []
+                experiment_name = None
                 for batch in batches:
                     results = await self._evaluate_prompt(
-                        current_prompt, task, batch, debug=debug
+                        current_prompt,
+                        task,
+                        batch,
+                        debug=debug,
+                        experiment_name=experiment_name,
                     )
+                    next_action = "continue"
+                    if use_annotation_queue:
+                        results, next_action = await self._wait_for_annotation_queue(
+                            results,
+                            use_annotation_queue,
+                            task,
+                            progress,
+                        )
                     train_scores = await self.calculate_scores(results)
-                    train_score = sum(train_scores.values()) / len(train_scores)
+                    train_score = (
+                        sum(train_scores.values()) / len(train_scores)
+                        if train_scores
+                        else None
+                    )
                     all_train_scores.append(train_score)
                     progress.console.print(
                         f"Batch train score: {train_score:.4f}", end="\n"
@@ -236,6 +258,8 @@ class PromptOptimizer:
                     )
                     current_prompt = improved.improved_prompt
                     progress.update(batch_task, advance=1)
+                    if next_action != "continue":
+                        break
 
                 console = Console()
 
@@ -252,9 +276,11 @@ class PromptOptimizer:
                     current_prompt, task, task.dev_dataset_name, debug=debug
                 )
                 dev_scores = await self.calculate_scores(dev_results)
-                dev_score = sum(dev_scores.values()) / len(dev_scores)
+                dev_score = (
+                    sum(dev_scores.values()) / len(dev_scores) if dev_scores else None
+                )
 
-                if dev_score > best_score:
+                if dev_score is not None and dev_score > best_score:
                     if best_prompt not in other_attempts:
                         other_attempts.append(best_prompt)
                     best_score = dev_score
@@ -317,8 +343,103 @@ class PromptOptimizer:
         _print_rich_diff(task.initial_prompt, best_prompt, title="Final Prompt Updates")
         return best_prompt, best_score
 
+    async def _wait_for_annotation_queue(
+        self,
+        results: list[ExperimentResultRow],
+        queue_name: str,
+        task: Task,
+        progress: Progress,
+    ) -> tuple[list[ExperimentResultRow], Literal["continue", "break"]]:
+        """Add runs to the queue and block to let a reviewer check the outputs and leave feedback."""
+        # Clear the queue of old things and add the new ones on.
+        queues = list(self.client.list_annotation_queues(name=queue_name))
+        if queues:
+            q = queues[0]
+            while True:
+                try:
+                    r = self.client.get_run_from_annotation_queue(q.id, index=0)
+                    self.client.delete_run_from_annotation_queue(q.id, run_id=r.id)
+                except Exception:
+                    break
+        else:
+            q = self.client.create_annotation_queue(
+                name=queue_name,
+                description=f"Annotation queue used for prompt optimization on {task.name}",
+            )
+        runs = [r["run"].id for r in results]
+        self.client.add_runs_to_annotation_queue(q.id, run_ids=runs)
+
+        # Now, log instrutions and await user input in the terminal.
+        # User input can either continue or break the loop
+        richprint(
+            Panel.fit(
+                f"[bold cyan]Annotation Queue Instructions:[/bold cyan]\n\n"
+                f"1. Go to {self.client._host_url}/o/{self.client._get_optional_tenant_id()}/annotation-queues/{q.id}/?runIndex=0\n"
+                f"2. Review the outputs and leave feedback on the runs.\n"
+                f"3. When finished, return here and enter 'continue' to proceed or 'break' to stop this epoch (continue to next epoch).\n",
+                title="Manual Review Required",
+                border_style="bold",
+            )
+        )
+        # Wait for the user to annotate some runs
+        user_input = "continue"
+        progress.stop()
+        console = progress.console
+        while True:
+            try:
+                user_input = (
+                    console.input(
+                        "\n\n[bold]Enter 'continue' to proceed, 'break' to stop, or 'q' to exit:[/bold] "
+                    )
+                    .strip()
+                    .lower()
+                )
+                if user_input in ["continue", "break", "q"]:
+                    break
+                elif user_input == "":  # Handle EOF (Ctrl+D on Unix, Ctrl+Z on Windows)
+                    console.print("\n[yellow]EOF detected. Exiting...[/yellow]")
+                    user_input = "q"
+                    break
+                else:
+                    console.print(
+                        "[red]Invalid input. Please enter 'continue', 'break', or 'q'.[/red]"
+                    )
+            except KeyboardInterrupt:
+                console.print(
+                    "[yellow]Ctrl+C detected. Please enter 'continue', 'break', or 'q'.[/yellow]"
+                )
+            except EOFError:
+                console.print("\n[yellow]EOF detected. Exiting...[/yellow]")
+                user_input = "q"
+                break
+            except Exception as e:
+                console.print(f"[red]An error occurred: {e}. Please try again.[/red]")
+
+        if user_input == "q":
+            console.print("[bold red]Exiting the whole process...[/bold red]")
+            import sys
+
+            sys.exit(0)
+        progress.start()
+        # Merge the user feedback in with the model feedback (stored locally)
+        feedback = list(
+            self.client.list_feedback(run_ids=runs, feedback_source_type="app")
+        )
+        results_dict = {r["run"].id: r for r in results}
+        for f in feedback:
+            results_dict[f.run_id]["evaluation_results"]["results"].append(
+                ls.EvaluationResult(key=f.key, score=f.score, comment=f.comment)
+            )
+
+        return list(results_dict.values()), user_input
+
     async def _evaluate_prompt(
-        self, prompt: str, task: Task, data: str | list, debug: bool = False
+        self,
+        prompt: str,
+        task: Task,
+        data: str | list,
+        debug: bool = False,
+        experiment_name: str | None = None,
     ) -> list[ExperimentResultRow]:
         """Evaluates a prompt against a task's dataset and evaluators."""
 
@@ -330,6 +451,7 @@ class PromptOptimizer:
             data=data,
             evaluators=task.evaluators,
             max_concurrency=0 if debug else None,
+            experiment=experiment_name,
         )
         return [r async for r in results]
 

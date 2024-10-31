@@ -33,7 +33,7 @@ Reference example: {reference}"""
 
 
 async def summary_quality(run, example):
-    predicted = run.outputs["summary"]
+    predicted = run.outputs.get("summary")
     rubric = """Grade the quality of summary. If it fails any criteria, give a 0. If it's perfect, give a 5.
 Criteria:
 - Must not include idle words like "the email is about X"
@@ -55,14 +55,21 @@ def accuracy_check(run, example, key: str):
     predicted = run.outputs.get(key)
     reference = example.outputs.get(key)
     if reference is None:
-        return {"key": f"{key}-correctness","comment": "Skipping - reference label not found."}
+        return {
+            "key": f"{key}-correctness",
+            "comment": "Skipping - reference label not found.",
+        }
     score = (
         predicted == reference
         if not isinstance(reference, list)
         else predicted in reference
     )
     pf = "Pass" if score else "Fail"
-    return {"key": f"{key}-correctness", "score": score, "comment": f"{pf}: Expected {reference}. Got: {predicted}. Why did you get this wrong? Think deeply and update associations."}
+    return {
+        "key": f"{key}-correctness",
+        "score": score,
+        "comment": f"{pf}",
+    }  #: Expected {reference}. Got: {predicted}. Why did you get this wrong? Think deeply and update associations."}
 
 
 classifiers = [

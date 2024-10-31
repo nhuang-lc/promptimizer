@@ -25,14 +25,26 @@ optimizer = PromptOptimizer(
 )
 
 
-async def run(task_name: str, batch_size: int, train_size: int, epochs: int, debug: bool = False):
+async def run(
+    task_name: str,
+    batch_size: int,
+    train_size: int,
+    epochs: int,
+    use_annotation_queue: str | None = None,
+    debug: bool = False,
+):
     task = tasks.get(task_name)
     if not task:
         raise ValueError(f"Unknown task: {task_name}")
 
     with ls.tracing_context(project_name="Optim"):
         return await optimizer.optimize_prompt(
-            task, batch_size=batch_size, train_size=train_size, epochs=epochs, debug=debug
+            task,
+            batch_size=batch_size,
+            train_size=train_size,
+            epochs=epochs,
+            use_annotation_queue=use_annotation_queue,
+            debug=debug,
         )
 
 
@@ -50,11 +62,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs", type=int, default=2, help="Number of epochs for optimization"
     )
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument(
-        "--debug", action="store_true", help="Enable debug mode"
+        "--use-annotation-queue",
+        type=str,
+        default=None,
+        help="The name of the annotation queue to use. Note: we will delete the queue whenever you resume training (on every batch).",
     )
 
     args = parser.parse_args()
 
-    results = asyncio.run(run(args.task, args.batch_size, args.train_size, args.epochs, args.debug))
+    results = asyncio.run(
+        run(
+            args.task,
+            args.batch_size,
+            args.train_size,
+            args.epochs,
+            args.use_annotation_queue,
+            args.debug,
+        )
+    )
     print(results)
