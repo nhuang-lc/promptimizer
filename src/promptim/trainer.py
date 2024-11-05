@@ -39,6 +39,11 @@ def _noop(*args, **kwargs):
 _runner.print = _noop  # type: ignore
 _arunner.print = _noop  # type: ignore
 
+DEFAULT_OPTIMIZER_MODEL_CONFIG = {
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens_to_sample": 8192,
+}
+DEFAULT_PROMPT_MODEL_CONFIG = {"model": "claude-3-5-haiku-20241022"}
 
 DEFAULT_METAPROMPT = """You are an expert prompt engineer tasked with improving prompts for AI tasks.
 You will use all means necessary to optimize the scores for the provided prompt so that the resulting model can
@@ -144,7 +149,6 @@ class PromptConfig:
                     if isinstance(prompt, StructuredPrompt) and isinstance(
                         bound_llm, RunnableBinding
                     ):
-                        # seq.steps[1].bind(**tmpl.last.dict(exclude={"bound"}))
                         seq: RunnableSequence = prompt | bound_llm.bound
                         rebound_llm = seq.steps[1]
                         parser = seq.steps[2]
@@ -158,7 +162,9 @@ class PromptConfig:
                         postlude = bound_llm
                 else:
                     # Default to gpt-4o-mini
-                    postlude = init_chat_model(**self.model_config)
+                    postlude = init_chat_model(
+                        **(self.model_config or DEFAULT_PROMPT_MODEL_CONFIG)
+                    )
                     if isinstance(prompt, StructuredPrompt):
                         postlude = RunnableSequence(*(prompt | postlude).steps[1:])
                 self._cached = prompt
@@ -230,7 +236,9 @@ class Task:
     @classmethod
     def from_dict(cls, d: dict):
         d_ = d.copy()
-        return cls(**{"initial_prompt": PromptConfig(**d_.pop("initial_prompt")), **d_})
+        kwargs = {"initial_prompt": PromptConfig(**d_.pop("initial_prompt")), **d_}
+        kwargs = {k: v for k, v in kwargs.items() if k in cls.__annotations__}
+        return cls(**kwargs)
 
     def describe(self):
         descript = self.description if self.description else self.name
@@ -277,9 +285,7 @@ class PromptOptimizer:
     @classmethod
     def from_config(cls, config: dict):
         cp = config.copy()
-        model_config = cp.pop(
-            "model", dict(model="claude-3-5-sonnet-20241022", max_tokens_to_sample=8192)
-        )
+        model_config = cp.pop("model", DEFAULT_OPTIMIZER_MODEL_CONFIG)
         model = init_chat_model(**model_config)
         return cls(model, **cp)
 
@@ -308,9 +314,47 @@ class PromptOptimizer:
                 border_style="bold",
             )
         )
-        dev_examples = list(
-            self.client.list_examples(dataset_name=task.dataset, splits=["dev"])
-        )
+        splits = {
+            split
+            for split in self.client.list_dataset_splits(dataset_name=task.dataset)
+        }
+        with Progress() as progress:
+            ptsk = progress.add_task("[cyan]Loading data...", total=1)
+            if "train" not in splits or "dev" not in splits or "test" not in splits:
+                progress.console.print(
+                    "[yellow]Warning: train/dev/test splits not found. Using all examples for train, dev, and test sets.[/yellow]"
+                )
+                all_examples = list(
+                    self.client.list_examples(dataset_name=task.dataset)
+                )
+                if not all_examples:
+                    raise ValueError(
+                        "The dataset is empty. Please provide a non-empty dataset. "
+                        "Ensure that you have correctly specified the dataset name in your config file, "
+                        "and that the dataset has been properly uploaded to LangSmith. "
+                        f"Current dataset name: '{task.dataset}'. "
+                    )
+                train_examples = all_examples.copy()
+                dev_examples = all_examples.copy()
+                test_examples = all_examples.copy()
+                progress.console.print(
+                    "[yellow]Warning: Using the same examples for train, dev, and test may lead to overfitting.[/yellow]"
+                )
+            else:
+                train_examples = list(
+                    self.client.list_examples(
+                        dataset_name=task.dataset, splits=["train"]
+                    )
+                )
+                dev_examples = list(
+                    self.client.list_examples(dataset_name=task.dataset, splits=["dev"])
+                )
+                test_examples = list(
+                    self.client.list_examples(
+                        dataset_name=task.dataset, splits=["test"]
+                    )
+                )
+            progress.update(ptsk, advance=1)
         with Progress() as progress:
             main_task = progress.add_task("[cyan]Optimizing prompt...", total=100)
 
@@ -348,9 +392,6 @@ class PromptOptimizer:
             # Step 2: Train
             progress.update(
                 main_task, advance=10, description="[cyan]Training prompt..."
-            )
-            train_examples = list(
-                self.client.list_examples(dataset_name=task.dataset, splits=["train"])
             )
 
             epoch_task = progress.add_task("[green]Epochs", total=epochs)
@@ -470,9 +511,7 @@ class PromptOptimizer:
             )
             del train_examples
             del dev_examples
-            test_examples = list(
-                self.client.list_examples(dataset_name=task.dataset, splits=["test"])
-            )
+
             initial_test_results = await self._evaluate_prompt(
                 task.initial_prompt,
                 task,
