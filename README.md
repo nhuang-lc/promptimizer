@@ -2,113 +2,154 @@
 
 Experimental **prompt** opt**im**ization library.
 
-## Example:
+## Quick start
 
-First install the CLI:
+Let's try prompt optimization on a simple task to generate tweets.
+
+### 1. Install
+
+First install the CLI.
 
 ```shell
 pip install -U promptim
 ```
 
-And make sure you have a valid [LangSmith API Key](https://smith.langchain.com/) in your environment.
+And make sure you have a valid [LangSmith API Key](https://smith.langchain.com/) in your environment. For the quick start task, we will use Anthropic's Claude model for our optimizer and for the target system.
 
 ```shell
 LANGSMITH_API_KEY=CHANGEME
-```
-
-Then, create a task to optimize over. A task defines the dataset, evaluators, and initial prompt to optimize. To create an example "tweet generation" task you can optimize, run the following command:
-
-```shell
-promptim create-task  ./my-task my-tweet-task11
-```
-
-This will create a dataset named "my-tweet-task1", clone a starter prompt (with the name "my-tweet-task1-starter"), and locally create a directory "my-task" with two files in it.
-
-To optimize your prompt, run the `train` command. If you are using the default optimizer configuration above, you will need to set an Anthropic API key:
-
-```shell
 ANTHROPIC_API_KEY=CHANGEME
 ```
 
-Then optimize your prompt:
+### 2. Create task
+
+Next, create a task to optimize over.
 
 ```shell
-promptim train --task ./my-task/config.json
+promptim create task ./my-tweet-task
 ```
 
-You will see the progress in your terminal.
+Each task requires a few things. When the CLI requests, provide the corresponding values.
+1.  name: provide a useful name for the task (like "ticket classifier" or "report generator"). You may use the default here.
+2.  prompt: this is an identifier in the LangSmith prompt hub. Use the following public prompt to start:
+```
+langchain-ai/tweet-generator-example-with-nothing:starter
+```
+Hit "Enter" to confirm cloning into your workspace (so that you can push optimized commits to it).
+3. dataset: this is the name (or public URL) for the dataset we are optimizing over. Optionally, it can have train/dev/test splits to report separate metrics throughout the training process.
+```
+https://smith.langchain.com/public/6ed521df-c0d8-42b7-a0db-48dd73a0c680/d
+```
+4.  description: this is a high-level description of the purpose for this prompt. The optimizer uses this to help focus its improvements.
+```
+Write informative tweets on any subject.
+```
 
-## Create a custom task
+Once you've completed the template creation, you should have two files in hte `my-tweet-task` directory:
 
-Currently, `promptim` runs over individual **tasks**. A task defines the dataset (with train/dev/test splits), initial prompt, evaluators, and other information needed to optimize your prompt.
+```shell
+└── my-tweet-task
+    ├── config.json
+    └── task.py
+```
+
+We can ignore the `config.json` file for now (we'll discuss that later). The last thing we need to do before training is create an evaluator.
+
+### 3. Define evaluators
+
+Next we need to quantify prompt performance on our task. What does "good" and "bad" look like? We do this using evaluators.
+
+Open the evaluator stub written in `my-tweet-task/task.py` and find the line that assigns a score to a prediction:
 
 ```python
-    name: str  # The name of the task
-    description: str = ""  # A description of the task (optional)
-    evaluator_descriptions: dict = field(default_factory=dict)  # Descriptions of the evaluation metrics
-    dataset: str  # The name of the dataset to use for the task
-    initial_prompt: PromptConfig  # The initial prompt configuration.
-    evaluators: list[Callable[[Run, Example], dict]]  # List of evaluation functions
-    system: Optional[SystemType] = None  # Optional custom function with signature (current_prompt: ChatPromptTemplate, inputs: dict) -> outputs
+    # Implement your evaluation logic here
+    score = len(str(predicted.content)) < 180  # Replace with actual score
 ```
 
-Let's walk through the example ["tweet writer"](./examples/tweet_writer/task.py) task to see what's expected. First, view the [config.json](./examples/tweet_writer/config.json) file
-
-```json
-{
-  "optimizer": {
-    "model": {
-      "model": "claude-3-5-sonnet-20241022",
-      "max_tokens_to_sample": 8192
-    }
-  },
-  "task": "examples/tweet_writer/task.py:tweet_task"
-}
+We are going to make this evaluator penalize outputs with hashtags. Update that line to be:
+```python
+    score = int("#" not in result)
 ```
 
-The first part contains confgiuration for the optimizer process. For now, this is a simple configuration for the default (and only) metaprmopt optimizer. You can control which LLM is used via the `model` configuration.
+Next, update the evaluator name. We do this using the `key` field in the evaluator response.
+```python
+    "key": "tweet_omits_hashtags",
+```
 
-The second part is the path to the task file itself. We will review this below.
+To help the optimizer know the ideal behavior, we can add additional instrutions in the `comment` field in the response.
+
+Update the "comment" line to explicitly give pass/fail comments:
+```python
+        "comment": "Pass: tweet omits hashtags" if score == 1 else "Fail: omit all hashtags from generated tweets",
+```
+
+And now we're ready to train! The final evaluator should look like:
 
 ```python
-def multiple_lines(run, example):
-    """Evaluate if the tweet contains multiple lines."""
-    result = run.outputs.get("tweet", "")
-    score = int("\n" in result)
-    comment = "Pass" if score == 1 else "Fail"
+def example_evaluator(run: Run, example: Example) -> dict:
+    """An example evaluator. Larger numbers are better."""
+    predicted: AIMessage = run.outputs["output"]
+
+    result = str(predicted.content)
+    score = int("#" not in result)
     return {
-        "key": "multiline",
+        "key": "tweet_omits_hashtags",
         "score": score,
-        "comment": comment,
+        "comment": "Pass: tweet omits hashtags" if score == 1 else "Fail: omit all hashtags from generated tweets",
     }
 
-
-tweet_task = dict(
-    name="Tweet Generator",
-    dataset="tweet-optim",
-    initial_prompt={
-        "identifier": "tweet-generator-example:c39837bd",
-    },
-    # See the starting prompt here:
-    # https://smith.langchain.com/hub/langchain-ai/tweet-generator-example/c39837bd
-    evaluators=[multiple_lines],
-    evaluator_descriptions={
-        "under_180_chars": "Checks if the tweet is under 180 characters. 1 if true, 0 if false.",
-        "no_hashtags": "Checks if the tweet contains no hashtags. 1 if true, 0 if false.",
-        "multiline": "Fails if the tweet is not multiple lines. 1 if true, 0 if false. 0 is bad.",
-    },
-)
 ```
 
-We've defined a simple [evaluator](https://docs.smith.langchain.com/evaluation/how_to_guides/evaluation/evaluate_llm_application#use-custom-evaluators) to check that the output spans multiple lines.
+### 4. Train
 
-We have also selected an initial prompt to optimize. You can check this out [in the hub](https://smith.langchain.com/hub/langchain-ai/tweet-generator-example/c39837bd).
+To start optimizing your prompt, run the `train` command:
 
-By modifying the above values, you can configure your own task.
+```shell
+promptim train --task ./my-tweet-task/config.json
+```
 
-## CLI Arguments
+You will see the progress in your terminal. once it's completed, the training job will print out the final "optimized" prompt in the terminal, as well as a link to the commit in the hub.
 
-The CLI is experimental.
+### Explanation
+
+Whenever you you run `promptim train`, promptim first loads the prompt and dataset specified in your configuration. It then evaluates your prompt on the dev split (if present; full dataset otherwise) using the evaluator(s) configured above. This gives us baseline metrics to compare against throughout the optimization process.
+
+After computing a baseline, `promptim` begins optimizing the prompt by looping over minibatches of training examples. For each minibatch, `promptim` computes the metrics and then applies a **metaprompt** to suggest changes to the current prompt. It then applies that updated prompt to the next minibatch of training examples and repeats the process. It does this over the entire **train** split (if present, full dataset otherwise).
+
+After `promptim` has consumed the whole `train` split, it computes metrics again on the `dev` split. If the metrics show improvement (average score is greater), then the updated prompt is retained for the next round. If the metrics are the same or worse than the current best score, the prompt is discarded.
+
+This process is repeated `--num-epochs` times before the process terminates.
+
+## How to
+
+### Add human labels
+
+To add human labeling using the annotation queue:
+
+1. Set up an annotation queue:
+   When running the `train` command, use the `--annotation-queue` option to specify a queue name:
+   ```
+   promptim train --task ./my-tweet-task/config.json --annotation-queue my_queue
+   ```
+
+2. During training, the system will pause after each batch and print out instructions on how to label the results. It will wait for human annotations.
+
+3. Access the annotation interface:
+   - Open the LangSmith UI
+   - Navigate to the specified queue (e.g., "my_queue")
+   - Review and label as many examples as you'd like, adding notes and scores
+
+4. Resume:
+   - Type 'c' in the terminal
+   - The training loop will fetch your annotations and include them in the metaprompt's next optimizatin pass
+
+This human-in-the-loop approach allows you to guide the prompt optimization process by providing direct feedback on the model's outputs.
+
+## Reference
+
+### CLI Arguments
+
+The current CLI arguments are as follows. They are experimental and may change in the future:
 
 ```shell
 Usage: promptim [OPTIONS] COMMAND [ARGS]...
@@ -120,10 +161,44 @@ Options:
   --help     Show this message and exit.
 
 Commands:
-  create-task  Create a new task directory with config.json, task file,...
-  train        Train and optimize prompts for different tasks.
-
+  create  Commands for creating new tasks and examples.
+  train   Train and optimize prompts for different tasks.
 ```
+
+#### create
+
+
+```shell
+Usage: promptim create [OPTIONS] COMMAND [ARGS]...
+
+  Commands for creating new tasks and examples.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  example  Clone a pre-made tweet generation task
+  task     Walkthrough to create a new task directory from your own prompt and dataset
+```
+
+`promptim create task`
+
+```shell
+Usage: promptim create task [OPTIONS] PATH
+
+  Create a new task directory with config.json and task file for a custom
+  prompt and dataset.
+
+Options:
+  --name TEXT         Name for the task.
+  --prompt TEXT       Name of the prompt in LangSmith
+  --description TEXT  Description of the task for the optimizer.
+  --dataset TEXT      Name of the dataset in LangSmith
+  --help              Show this message and exit.
+```
+
+
+#### train
 
 ```shell
 Usage: promptim train [OPTIONS]
@@ -131,29 +206,20 @@ Usage: promptim train [OPTIONS]
   Train and optimize prompts for different tasks.
 
 Options:
-  --task TEXT                  Task to optimize. You can pick one off the
-                               shelf or select a path to a config file.
-                               Example: 'examples/tweet_writer/config.json
-  --batch-size INTEGER         Batch size for optimization
-  --train-size INTEGER         Training size for optimization
-  --epochs INTEGER             Number of epochs for optimization
-  --debug                      Enable debug mode
-  --use-annotation-queue TEXT  The name of the annotation queue to use. Note:
-                               we will delete the queue whenever you resume
-                               training (on every batch).
-  --no-commit                  Do not commit the optimized prompt to the hub
-  --help                       Show this message and exit.
+  --task TEXT              Task to optimize. You can pick one off the shelf or
+                           select a path to a config file. Example:
+                           'examples/tweet_writer/config.json
+  --batch-size INTEGER     Batch size for optimization
+  --train-size INTEGER     Training size for optimization
+  --epochs INTEGER         Number of epochs for optimization
+  --debug                  Enable debug mode
+  --annotation-queue TEXT  The name of the annotation queue to use. Note: we
+                           will delete the queue whenever you resume training
+                           (on every batch).
+  --no-commit              Do not commit the optimized prompt to the hub
+  --help                   Show this message and exit.
 ```
 
-```shell
-Usage: promptim create-task [OPTIONS] PATH NAME
-
-  Create a new task directory with config.json, task file, and example
-  dataset.
-
-Options:
-  --help  Show this message and exit.
-```
 
 We have created a few off-the-shelf tasks you can choose from:
 

@@ -1,0 +1,164 @@
+{
+  "$defs": {
+    "OptimizerConfig": {
+      "properties": {
+        "model": {
+          "description": "Configuration for the model used in optimization, including model name and parameters.",
+          "title": "Model",
+          "type": "object"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "title": "OptimizerConfig",
+      "type": "object"
+    },
+    "PromptConfig": {
+      "properties": {
+        "identifier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "If optimizing a prompt in the hub. Do not provide if providing a prompt string directly.",
+          "title": "Identifier"
+        },
+        "prompt_str": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "If optimizing a local string. Do not provide if providing a repo.",
+          "title": "Prompt Str"
+        },
+        "model_config": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Configuration for the model used in optimization.",
+          "title": "Model Config"
+        },
+        "which": {
+          "default": 0,
+          "description": "Which message to optimize.",
+          "title": "Which",
+          "type": "integer"
+        }
+      },
+      "title": "PromptConfig",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "dataset": {
+      "title": "Dataset",
+      "type": "string"
+    },
+    "initial_prompt": {
+      "$ref": "#/$defs/PromptConfig"
+    },
+    "description": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": "",
+      "title": "Description"
+    },
+    "evaluator_descriptions": {
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Evaluator Descriptions"
+    },
+    "baseline_experiment": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Baseline Experiment"
+    },
+    "optimizer": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OptimizerConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Configuration for the optimization process, including model settings."
+    },
+    "evaluators": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Path to the Python file and variable name containing the evaluator functions for the task.\n\nExample:\n    ./task/evaluators.py:evaluators",
+      "title": "Evaluators"
+    },
+    "system": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Path to the Python file defining the system configuration for executing prompts.\n\nExample:\n    ./task/my_system.py:chain",
+      "title": "System"
+    }
+  },
+  "required": [
+    "name",
+    "dataset",
+    "initial_prompt",
+    "evaluators"
+  ],
+  "title": "Config",
+  "type": "object",
+  "$schema": "http://json-schema.org/draft-07/schema#"
+}
