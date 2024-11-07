@@ -4,7 +4,7 @@ Promptim is an experimental **prompt** opt**im**ization library to help you syst
 
 Promptim automates the process of improving prompts on specific tasks. You provide initial prompt, a dataset, and custom evaluators (and optional human feedback), and `promptim` runs an optimization loop to produce a refined prompt that aims to outperform the original.
 
-For setup and usage details, see the Quick Start guide below.
+For setup and usage details, see the quick start guide below.
 
 ![Optimization](./static/optimizer.gif)
 

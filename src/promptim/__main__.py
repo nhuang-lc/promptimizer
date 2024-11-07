@@ -96,13 +96,6 @@ async def run(
     return prompt, score
 
 
-# Users may need help understanding:
-# - What types of tasks can be optimized
-# - How to set up a task for optimization
-# - Where to find pre-defined tasks or how to create custom ones
-# - What the optimization process entails
-
-
 @click.group()
 @click.version_option(version="1")
 def cli():
