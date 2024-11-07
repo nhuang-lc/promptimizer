@@ -98,7 +98,7 @@ The improved prompt must:
 
 Use prompting strategies as appropriate for the task. For logic and math, consider encourage more chain-of-thought reasoning, 
 or include reasoning trajectories to induce better performance. For creative tasks, consider adding style guidelines.
-Or consider including examplars.
+Or consider including exemplars.
 
 Output your response in this format:
 <analysis>
@@ -163,6 +163,9 @@ class PromptWrapper(PromptConfig):
             if self.prompt_str:
                 self._cached = ChatPromptTemplate.from_messages(
                     [("user", self.prompt_str)]
+                )
+                self._postlude = init_chat_model(
+                    **(self.model_config or DEFAULT_PROMPT_MODEL_CONFIG)
                 )
             else:
                 client = client or ls.Client()
@@ -402,6 +405,13 @@ class PromptOptimizer:
     ) -> tuple[PromptWrapper, float]:
         """Optimizes a prompt for a specific task through multiple iterations."""
         initial_prompt = PromptWrapper.from_config(task.initial_prompt)
+        if initial_prompt.prompt_str:
+            if commit_prompts:
+                richprint(
+                    "[yellow]Warning: No prompt identifier is configured for this run. "
+                    "Prompts will not be committed.[/yellow]"
+                )
+                commit_prompts = False
         if task.system is None:
             task.system = task.get_prompt_system(initial_prompt)
         initial_prompt.load(self.client)  # check
@@ -741,7 +751,7 @@ class PromptOptimizer:
                     raise
                 time.sleep(i)
 
-        # Now, log instrutions and await user input in the terminal.
+        # Now, log instructions and await user input in the terminal.
         # User input can either continue or break the loop
         richprint(
             Panel.fit(

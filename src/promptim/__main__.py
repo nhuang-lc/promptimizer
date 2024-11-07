@@ -96,35 +96,74 @@ async def run(
     return prompt, score
 
 
+# Users may need help understanding:
+# - What types of tasks can be optimized
+# - How to set up a task for optimization
+# - Where to find pre-defined tasks or how to create custom ones
+# - What the optimization process entails
+
+
 @click.group()
 @click.version_option(version="1")
 def cli():
-    """Optimize prompts for different tasks."""
+    """Optimize prompts for AI tasks using automated evaluation and feedback.
+
+    Promptim helps improve prompts for various AI tasks by running an optimization loop.
+    You provide an initial prompt, a dataset, and custom evaluators. Promptim then
+    iteratively refines the prompt to improve performance on your specific task.
+
+    To get started, create a task configuration or use a pre-defined one, then run
+    the 'train' command to begin optimization.
+
+    Example:
+        promptim train --task ./my-task/config.json
+    """
     pass
 
 
 @cli.command()
 @click.option(
     "--task",
-    help="Task to optimize. You can pick one off the shelf or select a path to a config file. "
-    "Example: 'examples/tweet_writer/config.json",
+    help="Task to optimize. Specify a pre-defined task name or path to a custom config file. "
+    "The task defines the dataset, evaluators, and initial prompt to optimize. "
+    "Example: 'examples/tweet_writer/config.json' for a custom task, or 'sentiment_analysis' for a pre-defined task.",
 )
-@click.option("--batch-size", type=int, default=40, help="Batch size for optimization")
 @click.option(
-    "--train-size", type=int, default=40, help="Training size for optimization"
+    "--batch-size",
+    type=int,
+    default=40,
+    help="Number of examples to process in each optimization iteration. "
+    "Larger batches may improve stability but are limited by the metaprompter's maximum context window size.",
 )
-@click.option("--epochs", type=int, default=2, help="Number of epochs for optimization")
-@click.option("--debug", is_flag=True, help="Enable debug mode")
+@click.option(
+    "--train-size",
+    type=int,
+    default=40,
+    help="Maximum number of training examples to use per epoch. Useful for limiting optimization time on large datasets. "
+    "If smaller than total available data, a random subset will be used each epoch.",
+)
+@click.option(
+    "--epochs",
+    type=int,
+    default=2,
+    help="Number of complete passes through the training data. More epochs may improve results but increase runtime.",
+)
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="Enable debug mode for verbose logging and sequential processing.",
+)
 @click.option(
     "--annotation-queue",
     type=str,
     default=None,
-    help="The name of the annotation queue to use. Note: we will delete the queue whenever you resume training (on every batch).",
+    help="Name of the LangSmith annotation queue for manual review of optimization results. "
+    "The queue will be cleared and updated on each batch.",
 )
 @click.option(
     "--no-commit",
     is_flag=True,
-    help="Do not commit the optimized prompt to the hub",
+    help="Prevent committing the optimized prompt to the LangChain Hub. Use this for local experimentation.",
 )
 def train(
     task: str,
@@ -157,7 +196,7 @@ def train(
 
 @cli.group()
 def create():
-    """Commands for creating new tasks and examples."""
+    """Commands for creating new tasks."""
     pass
 
 
@@ -169,7 +208,7 @@ class MissingPromptError(ValueError):
         super().__init__(f"Prompt not found: {attempted}")
 
 
-def _try_get_prompt(client, prompt: str | None):
+def _try_get_prompt(client, prompt: str | None, yes: bool):
     from langsmith import Client
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.runnables import RunnableSequence, RunnableBinding
@@ -177,7 +216,7 @@ def _try_get_prompt(client, prompt: str | None):
 
     expected_run_outputs = 'predicted: AIMessage = run.outputs["output"]'
     client = cast(Client, client)
-    if prompt is None:
+    if prompt is None and not yes:
         prompt = click.prompt(
             "Enter the identifier for the initial prompt\n"
             "\tFormat: prompt-name"
@@ -190,6 +229,8 @@ def _try_get_prompt(client, prompt: str | None):
         if prompt == "q":
             click.echo("Exiting task creation.")
             sys.exit()
+    elif prompt is None and yes:
+        raise ValueError("Prompt identifier is required when using --yes flag")
 
     # Fetch prompt
     try:
@@ -251,10 +292,13 @@ def _try_get_prompt(client, prompt: str | None):
                     )
                     identifier = target_repo
             else:
-                clone_confirmation = click.confirm(
-                    f"Would you like to clone prompt {target_repo} to your workspace before continuing?",
-                    default=True,
-                )
+                if yes:
+                    clone_confirmation = True
+                else:
+                    clone_confirmation = click.confirm(
+                        f"Would you like to clone prompt {target_repo} to your workspace before continuing?",
+                        default=True,
+                    )
 
                 if clone_confirmation:
                     try:
@@ -288,14 +332,18 @@ def _try_get_prompt(client, prompt: str | None):
     return prompt_obj, identifier, expected_run_outputs
 
 
-def get_prompt(client, prompt: str | None):
+def get_prompt(client, prompt: str | None, yes: bool):
     from langsmith import Client
 
     client = cast(Client, client)
     while True:
         try:
-            return _try_get_prompt(client, prompt)
+            return _try_get_prompt(client, prompt, yes)
         except MissingPromptError as e:
+            if yes:
+                raise ValueError(
+                    f"Prompt not found: {e.attempted}. Cannot proceed with --yes flag."
+                )
             click.echo(f"Could not find prompt: {e.attempted}")
             response = client.list_prompts(
                 query=e.attempted.split(":")[0].strip(),
@@ -328,6 +376,8 @@ def get_prompt(client, prompt: str | None):
             sys.exit()
         except Exception as e:
             click.echo(f"Error loading prompt: {e!r}")
+            if yes:
+                raise
             click.echo("Please try again or press 'q' to quit.")
             prompt = None
 
@@ -340,15 +390,35 @@ class MissingDatasetError(ValueError):
         super().__init__(f"Dataset not found: {attempted}")
 
 
-def get_dataset(client, dataset: str | None):
+def get_dataset(client, dataset: str | None, yes: bool):
     from langsmith import Client
 
     client = cast(Client, client)
     while True:
         try:
+            if dataset is None and not yes:
+                dataset = click.prompt(
+                    "Enter the name of an existing dataset or a URL of a public dataset:\n"
+                    "\tExamples:\n"
+                    "\t  - my-dataset\n"
+                    "\t  - https://smith.langchain.com/public/6ed521df-c0d8-42b7-a0db-48dd73a0c680/d\n"
+                    "Dataset name or URL"
+                )
+                if dataset == "q":
+                    click.echo("Exiting task creation.")
+                    sys.exit()
+            elif dataset is None and yes:
+                raise ValueError(
+                    "Dataset name or URL is required when using --yes flag"
+                )
+
             return _try_get_dataset(client, dataset)
         except MissingDatasetError as e:
-            print(f"Could not find dataset: {e.attempted}")
+            if yes:
+                raise ValueError(
+                    f"Dataset not found: {e.attempted}. Cannot proceed with --yes flag."
+                )
+            click.echo(f"Could not find dataset: {e.attempted}")
             response = client.list_datasets(
                 dataset_name_contains=e.attempted,
                 limit=10,
@@ -365,12 +435,12 @@ def get_dataset(client, dataset: str | None):
                     return ds
                 else:
                     dataset = None
-                    print("Please try again or press 'q' to quit.")
+                    click.echo("Please try again or press 'q' to quit.")
             else:
-                print("Did you mean one of these?")
+                click.echo("Did you mean one of these?")
                 for i, match in enumerate(matches, 1):
-                    print(f"{i}. {match}")
-                print(f"{len(matches) + 1}. Create a new dataset")
+                    click.echo(f"{i}. {match}")
+                click.echo(f"{len(matches) + 1}. Create a new dataset")
                 selection = click.prompt(
                     "Enter the number of your selection, type a name to try again, or choose to create a new dataset"
                 )
@@ -386,30 +456,21 @@ def get_dataset(client, dataset: str | None):
                     sys.exit()
                 else:
                     dataset = selection.strip() or None
-                    print("Please try again or press 'q' to quit.")
+                    click.echo("Please try again or press 'q' to quit.")
         except click.Abort:
             sys.exit()
         except Exception as e:
-            print(f"Error loading dataset: {e!r}")
-            print("Please try again or press 'q' to quit.")
+            click.echo(f"Error loading dataset: {e!r}")
+            if yes:
+                raise
+            click.echo("Please try again or press 'q' to quit.")
             dataset = None
 
 
-def _try_get_dataset(client, dataset: str | None):
+def _try_get_dataset(client, dataset: str):
     from langsmith import Client
 
     client = cast(Client, client)
-    if dataset is None:
-        dataset = click.prompt(
-            "Enter the name of an existing dataset or a URL of a public dataset:\n"
-            "\tExamples:\n"
-            "\t  - my-dataset\n"
-            "\t  - https://smith.langchain.com/public/6ed521df-c0d8-42b7-a0db-48dd73a0c680/d\n"
-            "Dataset name or URL"
-        )
-        if dataset == "q":
-            print("Exiting task creation.")
-            sys.exit()
 
     if dataset.startswith("https://"):
         ds = client.clone_public_dataset(dataset)
@@ -425,19 +486,43 @@ def _try_get_dataset(client, dataset: str | None):
 
 
 @create.command("task")
-@click.argument("path", type=click.Path(file_okay=False, dir_okay=True))
-@click.option("--name", required=False, help="Name for the task.")
-@click.option("--prompt", required=False, help="Name of the prompt in LangSmith")
-@click.option(
-    "--description", required=False, help="Description of the task for the optimizer."
+@click.argument(
+    "path",
+    type=click.Path(file_okay=False, dir_okay=True),
 )
-@click.option("--dataset", required=False, help="Name of the dataset in LangSmith")
+@click.option(
+    "--name",
+    required=False,
+    help="Name for the task. If not provided, the directory name will be used as default. This name will be used in the config.json file.",
+)
+@click.option(
+    "--prompt",
+    required=False,
+    help="Name of the prompt in LangSmith to be optimized. If not provided, you'll be prompted to select or create one. This will be used as the initial prompt for optimization.",
+)
+@click.option(
+    "--description",
+    required=False,
+    help="Description of the task for the optimizer. This helps guide the optimization process by providing context about the task's objectives and constraints.",
+)
+@click.option(
+    "--dataset",
+    required=False,
+    help="Name or public URL of the dataset in LangSmith to be used for training and evaluation. If not provided, you'll be prompted to select or create one. This dataset will be used to test and improve the prompt.",
+)
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Automatically answer yes to all CLI prompts. Use with caution as it skips confirmation steps and uses defaults where applicable.",
+)
 def create_task(
     path: str,
     name: str | None = None,
     prompt: str | None = None,
     dataset: str | None = None,
     description: str | None = None,
+    yes: bool = False,
 ):
     """Create a new task directory with config.json and task file for a custom prompt and dataset."""
     from langsmith import Client
@@ -456,11 +541,11 @@ def create_task(
             return
 
     expected_imports = "from langchain_core.messages import AIMessage"
-    prompt_obj, identifier, expected_run_outputs = get_prompt(client, prompt)
+    prompt_obj, identifier, expected_run_outputs = get_prompt(client, prompt, yes)
 
     # Create task directory
     os.makedirs(path, exist_ok=True)
-    ds = get_dataset(client, dataset)
+    ds = get_dataset(client, dataset, yes)
     try:
         example = next(client.list_examples(dataset_id=ds.id, limit=1))
     except Exception:
@@ -542,7 +627,7 @@ def example_evaluator(run: Run, example: Example) -> dict:
     \"\"\"An example evaluator. Larger numbers are better.\"\"\"
     # The Example object contains the inputs and reference labels from a single row in your dataset (if provided).
     {example_content}    
-    # The Run object countains the full trace of your system. Typically you run checks on the outputs,
+    # The Run object contains the full trace of your system. Typically you run checks on the outputs,
     # often comparing them to the reference_outputs 
     {expected_run_outputs}
 
@@ -573,8 +658,8 @@ evaluators = [example_evaluator]
     print(f"Task '{name}' created at {path}")
     print(f"Config file created at: {os.path.join(path, 'config.json')}")
     print(f"Task file created at: {os.path.join(path, 'task.py')}")
-    print(f"Using prompt:\n\n{prompt_obj.pretty_repr()}\n\n")
     print(f"Using dataset: {ds.url}")
+    print(f"Using prompt: {identifier}\n\n{prompt_obj.pretty_repr()}\n\n")
     print(
         f"Remember to implement your custom evaluators in {os.path.join(path, 'task.py')}"
     )
