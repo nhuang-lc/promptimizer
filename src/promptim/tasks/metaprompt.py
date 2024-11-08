@@ -1,17 +1,12 @@
 import langsmith as ls
 from langchain_anthropic import ChatAnthropic
-from promptim.trainer import (
-    PromptWrapper,
-    PromptOptimizer,
-    Task,
-    DEFAULT_METAPROMPT,
-)
-from promptim.tasks.scone import scone_task
-from promptim.tasks.tweet_generator import tweet_task
-from promptim.tasks.simpleqa import simpleqa_task
-from promptim.tasks.ticket_classification import ticket_classification_task
 from langchain_core.prompts import ChatPromptTemplate
 
+from promptim.tasks.scone import scone_task
+from promptim.tasks.simpleqa import simpleqa_task
+from promptim.tasks.ticket_classification import ticket_classification_task
+from promptim.tasks.tweet_generator import tweet_task
+from promptim.trainer import DEFAULT_METAPROMPT, PromptOptimizer, PromptWrapper, Task
 
 DEFAULT_METAMETAPROMPT = """You are an expert in prompt optimization systems. Your task is to improve the effectiveness of prompt optimization prompts - the prompts used to guide the improvement of task-specific prompts.
 
@@ -187,8 +182,9 @@ metaprompt_task = Task(
 
 if __name__ == "__main__":
     import argparse
-    from langsmith import Client
     import random
+
+    from langsmith import Client
 
     random.seed(42)
 

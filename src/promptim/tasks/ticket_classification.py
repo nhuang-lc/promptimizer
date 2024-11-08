@@ -2,9 +2,9 @@ import functools
 import logging
 
 from langchain_openai import ChatOpenAI
-from promptim.trainer import PromptWrapper, Task
 from pydantic import BaseModel, Field
 
+from promptim.trainer import PromptWrapper, Task
 
 logger = logging.getLogger(__name__)
 

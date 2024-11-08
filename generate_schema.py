@@ -2,9 +2,10 @@ import json
 from dataclasses import fields
 from typing import Any, Optional, Type
 
-from promptim.trainer import Config
 from pydantic import BaseModel, Field, create_model
 from pydantic.json_schema import model_json_schema
+
+from promptim.trainer import Config
 
 
 def get_schema(cls: Type[Any]) -> dict:

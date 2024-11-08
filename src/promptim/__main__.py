@@ -2,12 +2,16 @@ import asyncio
 import importlib.util
 import json
 import os
-from typing import Optional, cast
+import sys
+import time
+from typing import TYPE_CHECKING, Optional
 
 import click
 import langsmith as ls
 from langsmith.utils import LangSmithNotFoundError
-import sys
+
+if TYPE_CHECKING:
+    from langsmith import Client
 
 
 def get_tasks(task_name: str):
@@ -201,14 +205,13 @@ class MissingPromptError(ValueError):
         super().__init__(f"Prompt not found: {attempted}")
 
 
-def _try_get_prompt(client, prompt: str | None, yes: bool):
-    from langsmith import Client
+def _try_get_prompt(client: Client, prompt: str | None, yes: bool):
     from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.runnables import RunnableSequence, RunnableBinding
+    from langchain_core.runnables import RunnableBinding, RunnableSequence
+
     from promptim.trainer import PromptWrapper
 
     expected_run_outputs = 'predicted: AIMessage = run.outputs["output"]'
-    client = cast(Client, client)
     if prompt is None and not yes:
         prompt = click.prompt(
             "Enter the identifier for the initial prompt\n"
@@ -256,9 +259,14 @@ def _try_get_prompt(client, prompt: str | None, yes: bool):
         raise ValueError(f"Unexpected prompt type: {type(prompt_obj)}\n\n{prompt_obj}")
     identifier = prompt
     if "/" in identifier:  # It may be a public prompt:
-        # CRAZY HANDLING I HATE THIS
-        tenant_id = client._get_tenant_id()
-        if prompt_repo.tenant_id != str(tenant_id):
+        tenant_id = None
+        for _ in range(4):
+            tenant_id = client._get_optional_tenant_id()
+            if tenant_id:
+                break
+            time.sleep(0.2)
+
+        if tenant_id is not None and prompt_repo.tenant_id != str(tenant_id):
             # Warn user and ask for confirmation to clone the prompt
             click.echo(
                 f"Warning: The prompt '{identifier}' does not belong to your workspace."
@@ -325,10 +333,7 @@ def _try_get_prompt(client, prompt: str | None, yes: bool):
     return prompt_obj, identifier, expected_run_outputs
 
 
-def get_prompt(client, prompt: str | None, yes: bool):
-    from langsmith import Client
-
-    client = cast(Client, client)
+def get_prompt(client: Client, prompt: str | None, yes: bool):
     while True:
         try:
             return _try_get_prompt(client, prompt, yes)
@@ -383,10 +388,7 @@ class MissingDatasetError(ValueError):
         super().__init__(f"Dataset not found: {attempted}")
 
 
-def get_dataset(client, dataset: str | None, yes: bool):
-    from langsmith import Client
-
-    client = cast(Client, client)
+def get_dataset(client: Client, dataset: str | None, yes: bool):
     while True:
         try:
             if dataset is None and not yes:
@@ -460,14 +462,9 @@ def get_dataset(client, dataset: str | None, yes: bool):
             dataset = None
 
 
-def _try_get_dataset(client, dataset: str):
-    from langsmith import Client
-
-    client = cast(Client, client)
-
+def _try_get_dataset(client: Client, dataset: str):
     if dataset.startswith("https://"):
-        ds = client.clone_public_dataset(dataset)
-        return ds
+        return client.clone_public_dataset(dataset)
 
     try:
         ds = client.read_dataset(dataset_name=dataset)
