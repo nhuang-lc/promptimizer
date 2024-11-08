@@ -172,6 +172,10 @@ class PromptWrapper(PromptConfig):
                 prompt = client.pull_prompt(self.identifier, include_model=True)
                 if isinstance(prompt, RunnableSequence):
                     prompt, postlude = prompt.first, prompt.steps[1]
+                    if self.model_config:
+                        postlude = init_chat_model(
+                            **(self.model_config or DEFAULT_PROMPT_MODEL_CONFIG)
+                        )
                 else:
                     # Default to gpt-4o-mini
                     postlude = init_chat_model(
