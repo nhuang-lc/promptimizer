@@ -266,16 +266,16 @@ It contains the following arguments:
 - `name` (string, required): The name of your task.
 - `dataset` (string, required): The name of the dataset in LangSmith to be used for training and evaluation.
 - `initial_prompt` (object, required): Configuration for the initial prompt to be optimized.
-  - `identifier` (string, optional): If optimizing a prompt from the hub. Do not provide if using a prompt string directly.
-  - `model_config` (object, optional): Configuration for the model used in optimization.
-  - `which` (integer, default: 0): Which message in the prompt to optimize.
+  - `identifier` (string, optional): Identifier for a prompt from the hub repository. Mutually exclusive with prompt_str.
+  - `prompt_str` (string, optional): Raw prompt string to optimize locally. Mutually exclusive with identifier.
+  - `model_config` (object, optional): Configuration dictionary specifying model parameters for optimization.
+  - `which` (integer, default: 0): Index of the message to optimize within the prompt.
 - `description` (string, optional): A detailed explanation of the task's objectives and constraints.
 - `evaluator_descriptions` (object, optional): A mapping of evaluator names to their descriptions.
-- `optimizer` (object, optional): Configuration for the optimization process.
-  - `model` (object, required): Configuration for the model used in optimization, including model name and parameters.
-- `evaluators` (string, required): Path to the Python file and variable name containing the evaluator functions for the task. Example: `./task/evaluators.py:evaluators`
-- `system` (string, optional): Path to the Python file defining the custom system for making predictions. If not provided, one will be constructed for you (contaiing just a prompt and LLM). Example: `./task/my_system.py:chain`
-
+- `optimizer` (object, optional): Configuration specifying model settings and hyperparameters. If not provided, default configuration will be used.
+  - `model` (object, required): Model configuration dictionary specifying the model name, parameters, and other settings used by the optimizer.
+- `evaluators` (string, required): Import path to evaluator functions in format 'file_path:variable_name'. The functions should evaluate prompt quality. Example: `./task/evaluators.py:evaluators`
+- `system` (string, optional): Import path to system configuration in format 'file_path:variable_name'. Defines how prompts are executed. If not provided, a default system with just a prompt and LLM will be constructed. Example: `./task/my_system.py:chain`
 
 Below is an example `config.json` file:
 

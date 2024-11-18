@@ -119,21 +119,24 @@ class PromptConfig:
     identifier: str | None = field(
         default=None,
         metadata={
-            "description": "If optimizing a prompt in the hub. Do not provide if providing a prompt string directly."
+            "description": "Identifier for a prompt from the hub repository. Mutually exclusive with prompt_str."
         },
     )
     prompt_str: str | None = field(
         default=None,
         metadata={
-            "description": "If optimizing a local string. Do not provide if providing a repo."
+            "description": "Raw prompt string to optimize locally. Mutually exclusive with identifier."
         },
     )
     model_config: dict | None = field(
         default=None,
-        metadata={"description": "Configuration for the model used in optimization."},
+        metadata={
+            "description": "Configuration dictionary specifying model parameters for optimization."
+        },
     )
     which: int = field(
-        default=0, metadata={"description": "Which message to optimize."}
+        default=0,
+        metadata={"description": "Index of the message to optimize within the prompt."},
     )
 
     def __post_init__(self):
@@ -174,15 +177,28 @@ class PromptWrapper(PromptConfig):
                 prompt = client.pull_prompt(self.identifier, include_model=True)
                 if isinstance(prompt, RunnableSequence):
                     prompt, bound_llm = prompt.first, prompt.steps[1]
+                    if isinstance(bound_llm, RunnableBinding):
+                        if tools := bound_llm.kwargs.get("tools"):
+                            bound_llm.kwargs["tools"] = _ensure_stricty(tools)
                     if isinstance(prompt, StructuredPrompt) and isinstance(
                         bound_llm, RunnableBinding
                     ):
                         seq: RunnableSequence = prompt | bound_llm.bound
+
                         rebound_llm = seq.steps[1]
+                        if tools := rebound_llm.kwargs.get("tools"):
+                            rebound_llm.kwargs["tools"] = _ensure_stricty(tools)
                         parser = seq.steps[2]
                         postlude = RunnableSequence(
                             rebound_llm.bind(
-                                **{**bound_llm.kwargs, **(self.model_config or {})}
+                                **{
+                                    **{
+                                        k: v
+                                        for k, v in (bound_llm.kwargs or {}).items()
+                                        if k not in rebound_llm.kwargs
+                                    },
+                                    **(self.model_config or {}),
+                                }
                             ),
                             parser,
                         )
@@ -351,7 +367,7 @@ class Task(TaskLike):
 class OptimizerConfig:
     model: dict = field(
         metadata={
-            "description": "Configuration for the model used in optimization, including model name and parameters."
+            "description": "Model configuration dictionary specifying the model name, parameters, and other settings used during optimization."
         }
     )
 
@@ -361,13 +377,13 @@ class Config(TaskLike):
     optimizer: OptimizerConfig | None = field(
         default=None,
         metadata={
-            "description": "Configuration for the optimization process, including model settings."
+            "description": "Optimization configuration specifying model settings and hyperparameters. If None, default configuration will be used."
         },
     )
     evaluators: str = field(
         metadata={
             "description": (
-                "Path to the Python file and variable name containing the evaluator functions for the task.\n\n"
+                "Import path to evaluator functions in format 'file_path:variable_name'. The functions should evaluate prompt quality.\n\n"
                 "Example:\n    ./task/evaluators.py:evaluators"
             )
         }
@@ -376,7 +392,7 @@ class Config(TaskLike):
         default=None,
         metadata={
             "description": (
-                "Path to the Python file defining the system configuration for executing prompts.\n\n"
+                "Import path to system configuration in format 'file_path:variable_name'. Defines how prompts are executed.\n\n"
                 "Example:\n    ./task/my_system.py:chain"
             )
         },
@@ -1008,10 +1024,26 @@ def _colorize_diff(diff):
             yield f"[red]{diff.a[i1:i2]}[/red][green]{diff.b[j1:j2]}[/green]"
 
 
-def _print_rich_diff(original: str, updated: str, title: str = ""):
+def _print_rich_diff(original: str, updated: str, title: str = "") -> None:
     diff = SequenceMatcher(None, original, updated)
     colorized_diff = "".join(_colorize_diff(diff))
     panel = Panel(
         colorized_diff, title=title or "Prompt Diff", expand=False, border_style="bold"
     )
     richprint(panel)
+
+
+def _ensure_stricty(tools: list) -> list:
+    result = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            strict = None
+            if func := tool.get("function"):
+                if parameters := func.get("parameters"):
+                    if "strict" in parameters:
+                        strict = parameters["strict"]
+            if strict is not None:
+                tool = copy.deepcopy(tool)
+                tool["function"]["strict"] = strict
+        result.append(tool)
+    return result

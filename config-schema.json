@@ -3,7 +3,7 @@
     "OptimizerConfig": {
       "properties": {
         "model": {
-          "description": "Configuration for the model used in optimization, including model name and parameters.",
+          "description": "Model configuration dictionary specifying the model name, parameters, and other settings used during optimization.",
           "title": "Model",
           "type": "object"
         }
@@ -26,7 +26,7 @@
             }
           ],
           "default": null,
-          "description": "If optimizing a prompt in the hub. Do not provide if providing a prompt string directly.",
+          "description": "Identifier for a prompt from the hub repository. Mutually exclusive with prompt_str.",
           "title": "Identifier"
         },
         "prompt_str": {
@@ -39,7 +39,7 @@
             }
           ],
           "default": null,
-          "description": "If optimizing a local string. Do not provide if providing a repo.",
+          "description": "Raw prompt string to optimize locally. Mutually exclusive with identifier.",
           "title": "Prompt Str"
         },
         "model_config": {
@@ -52,12 +52,12 @@
             }
           ],
           "default": null,
-          "description": "Configuration for the model used in optimization.",
+          "description": "Configuration dictionary specifying model parameters for optimization.",
           "title": "Model Config"
         },
         "which": {
           "default": 0,
-          "description": "Which message to optimize.",
+          "description": "Index of the message to optimize within the prompt.",
           "title": "Which",
           "type": "integer"
         }
@@ -124,7 +124,7 @@
         }
       ],
       "default": null,
-      "description": "Configuration for the optimization process, including model settings."
+      "description": "Optimization configuration specifying model settings and hyperparameters. If None, default configuration will be used."
     },
     "evaluators": {
       "anyOf": [
@@ -135,7 +135,7 @@
           "type": "null"
         }
       ],
-      "description": "Path to the Python file and variable name containing the evaluator functions for the task.\n\nExample:\n    ./task/evaluators.py:evaluators",
+      "description": "Import path to evaluator functions in format 'file_path:variable_name'. The functions should evaluate prompt quality.\n\nExample:\n    ./task/evaluators.py:evaluators",
       "title": "Evaluators"
     },
     "system": {
@@ -148,7 +148,7 @@
         }
       ],
       "default": null,
-      "description": "Path to the Python file defining the system configuration for executing prompts.\n\nExample:\n    ./task/my_system.py:chain",
+      "description": "Import path to system configuration in format 'file_path:variable_name'. Defines how prompts are executed.\n\nExample:\n    ./task/my_system.py:chain",
       "title": "System"
     }
   },
