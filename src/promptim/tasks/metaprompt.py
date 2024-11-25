@@ -6,8 +6,7 @@ from promptim.tasks.scone import scone_task
 from promptim.tasks.simpleqa import simpleqa_task
 from promptim.tasks.ticket_classification import ticket_classification_task
 from promptim.tasks.tweet_generator import tweet_task
-from promptim.trainer import (DEFAULT_METAPROMPT, PromptOptimizer,
-                              PromptWrapper, Task)
+from promptim.trainer import DEFAULT_METAPROMPT, PromptOptimizer, PromptWrapper, Task
 
 DEFAULT_METAMETAPROMPT = """You are an expert in prompt optimization systems. Your task is to improve the effectiveness of prompt optimization prompts - the prompts used to guide the improvement of task-specific prompts.
 
@@ -59,10 +58,16 @@ class MetapromptSystem:
     """System for running the metaprompt optimization task."""
 
     def __init__(self, task_map: dict[str, Task], meta_prompt: PromptWrapper):
+        from langchain.chat_models import init_chat_model
+
         self.task_map = task_map
-        self.model = ChatAnthropic(
-            model="claude-3-5-sonnet-20241022", max_tokens_to_sample=8192
-        )
+        try:
+            self.model = ChatAnthropic(
+                model="claude-3-5-sonnet-20241022", max_tokens_to_sample=8192
+            )
+        except Exception:
+            self.model = init_chat_model()
+
         self.trainer = PromptOptimizer(self.model, meta_prompt.get_prompt_str())
 
     async def __call__(self, prompt: ChatPromptTemplate, inputs: dict) -> dict:

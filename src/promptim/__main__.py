@@ -80,7 +80,9 @@ async def run(
     task, config = load_task(task_name)
     from promptim.trainer import PromptOptimizer
 
-    optimizer = PromptOptimizer.from_config(config.get("optimizer_config", {}))
+    optimizer = PromptOptimizer.from_config(
+        config.get("optimizer", config.get("optimizer_config", {}))
+    )
 
     with ls.tracing_context(project_name="Optim"):
         prompt, score = await optimizer.optimize_prompt(
@@ -211,7 +213,6 @@ def _try_get_prompt(client: Client, prompt: str | None, yes: bool):
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.prompts.structured import StructuredPrompt
     from langchain_core.runnables import RunnableBinding, RunnableSequence
-
     from promptim.trainer import PromptWrapper
 
     expected_run_outputs = 'predicted: AIMessage = run.outputs["output"]'

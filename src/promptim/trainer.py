@@ -471,7 +471,7 @@ class PromptOptimizer:
             for split in self.client.list_dataset_splits(dataset_name=task.dataset)
         }
         whole_banana = (
-            "train" not in splits or "dev" not in splits or "test" not in splits
+            "train" not in splits and "dev" not in splits and "test" not in splits
         )
         with Progress() as progress:
             ptsk = progress.add_task("[cyan]Loading data...", total=1)
@@ -516,6 +516,19 @@ class PromptOptimizer:
                     ),
                     key=lambda x: x.id,
                 )
+                if not train_examples:
+                    ids_ = {example.id for example in dev_examples + test_examples}
+                    train_examples = sorted(
+                        [
+                            example
+                            for example in self.client.list_examples(
+                                dataset_name=task.dataset
+                            )
+                            if example.id not in ids_
+                        ],
+                        key=lambda x: x.id,
+                    )
+                    del ids_
             train_examples, dev_examples, test_examples = self._validate_split_examples(
                 train_examples, dev_examples, test_examples, progress.console
             )
