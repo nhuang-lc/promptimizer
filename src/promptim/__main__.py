@@ -104,6 +104,30 @@ async def run(
     return prompt, score
 
 
+def load_environment():
+    """Load environment variables from environment files.
+
+    Attempts to load from .env file if it exists, using python-dotenv.
+    Only attempts to import dotenv if a file is found.
+    """
+    # Check common locations first before importing anything
+    for dirname in [os.getcwd()] + [os.path.dirname(p) for p in sys.path]:
+        check_path = os.path.join(dirname, ".env")
+        if os.path.isfile(check_path):
+            try:
+                from dotenv import load_dotenv
+            except ImportError:
+                click.secho(
+                    "python-dotenv package not installed. Environment variables will not be loaded from file.",
+                    fg="yellow",
+                )
+                return
+
+            load_dotenv(check_path)
+            click.echo(f"Loaded environment variables from {check_path}")
+            return
+
+
 @click.group()
 @click.version_option(version="1")
 def cli():
@@ -119,7 +143,7 @@ def cli():
     Example:
         promptim train --task ./my-task/config.json
     """
-    pass
+    load_environment()
 
 
 @cli.command()
@@ -213,6 +237,7 @@ def _try_get_prompt(client: Client, prompt: str | None, yes: bool):
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.prompts.structured import StructuredPrompt
     from langchain_core.runnables import RunnableBinding, RunnableSequence
+
     from promptim.trainer import PromptWrapper
 
     expected_run_outputs = 'predicted: AIMessage = run.outputs["output"]'
@@ -247,8 +272,8 @@ def _try_get_prompt(client: Client, prompt: str | None, yes: bool):
         raise ValueError(f"Unrecognized prompt format: {chain}")
     if isinstance(prompt_obj, StructuredPrompt):
         expected_run_outputs = "predicted: Output = run.outputs"
-    elif isinstance(prompt_obj, ChatPromptTemplate):
-        pass
+    elif isinstance(chain, RunnableSequence):
+        expected_run_outputs = 'predicted: AIMessage = run.outputs["output"]'
     elif (
         isinstance(chain, RunnableSequence)
         and isinstance(chain.steps[1], RunnableBinding)
@@ -594,9 +619,9 @@ def create_task(
         },
         "initial_prompt": {"identifier": identifier},
     }
-    config[
-        "$schema"
-    ] = "https://raw.githubusercontent.com/hinthornw/promptimizer/refs/heads/main/config-schema.json"
+    config["$schema"] = (
+        "https://raw.githubusercontent.com/hinthornw/promptimizer/refs/heads/main/config-schema.json"
+    )
     with open(os.path.join(path, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
@@ -785,9 +810,9 @@ def create_example_task(path: str, name: str):
         },
     }
 
-    config[
-        "$schema"
-    ] = "https://raw.githubusercontent.com/hinthornw/promptimizer/refs/heads/main/config-schema.json"
+    config["$schema"] = (
+        "https://raw.githubusercontent.com/hinthornw/promptimizer/refs/heads/main/config-schema.json"
+    )
     with open(os.path.join(path, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
