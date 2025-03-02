@@ -1,0 +1,19 @@
+{
+  "name": "email_cs_simple",
+  "dataset": "https://smith.langchain.com/public/c0af3eb3-6f91-47cd-965c-e3bea3140e09/d",
+  "description": "Triage emails",
+  "evaluators": "./evaluators.py:accuracy_evaluator",
+  "evaluator_descriptions": {
+    "accuracy": "Evaluates if the predicted category matches the reference class"
+  },
+  "optimizer": {
+    "model": {
+      "model": "claude-3-5-sonnet-20241022"
+    }
+  },
+  "initial_prompt": {
+    "identifier": "langchain-ai/email_cs_simple:933387ea",
+    "upload_to": "email_cs_simple"
+  },
+  "$schema": "https://raw.githubusercontent.com/hinthornw/promptimizer/refs/heads/main/config-schema.json"
+}

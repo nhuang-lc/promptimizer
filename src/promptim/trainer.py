@@ -1,30 +1,50 @@
-import copy
-import json
+import asyncio
+from contextlib import AsyncExitStack
+import csv
+import datetime
+import functools
+import math
+import os
 import random
+import statistics
 import time
+import weakref
+import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field, fields
-from difflib import SequenceMatcher
-from typing import Callable, Literal, Optional
+from dataclasses import asdict, is_dataclass
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Coroutine,
+    Literal,
+    Optional,
+    TypeVar,
+    Union,
+    overload,
+)
 from uuid import UUID
 
 import langsmith as ls
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
-from langchain_core.load import dumps
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.prompts.structured import StructuredPrompt
-from langchain_core.runnables import RunnableBinding, RunnableSequence
 from langsmith.evaluation import _arunner, _runner
 from langsmith.evaluation._arunner import ExperimentResultRow
-from langsmith.schemas import Example, Run
-from langsmith.utils import LangSmithConflictError
-from pydantic import BaseModel, Field
+from langsmith.schemas import Example, TracerSession
+from langsmith.utils import ContextThreadPoolExecutor
+from promptim import _utils as pm_utils
+from promptim import config as pm_config
+from promptim import optimizers as pm_optimizers
+from promptim import types as pm_types
 from rich import print as richprint
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress
 from rich.table import Table
+import logging
+
+if TYPE_CHECKING:
+    from promptim.algorithms import BaseAlgorithm
 
 
 def ltq():
@@ -41,423 +61,211 @@ def _noop(*args, **kwargs):
 
 _runner.print = _noop  # type: ignore
 _arunner.print = _noop  # type: ignore
-
-DEFAULT_OPTIMIZER_MODEL_CONFIG = {
-    "model": "claude-3-5-sonnet-20241022",
-    "max_tokens_to_sample": 8192,
-}
-DEFAULT_PROMPT_MODEL_CONFIG = {"model": "claude-3-5-haiku-20241022"}
-
-DEFAULT_METAPROMPT = """You are an expert prompt engineer tasked with improving prompts for AI tasks.
-You will use all means necessary to optimize the scores for the provided prompt so that the resulting model can
-perform well on the target task.
-
-## Current prompt
-
-The following is the current best-performing prompt:
-
-<current_prompt>
-{current_prompt}
-</current_prompt>
-
-Your generations will replace the content within the <TO_OPTIMIZE></TO_OPTIMIZE> tags. The rest is fixed context over which you have no control. The TO_OPTIMIZE and CONTEXT\
- tags are provided here to help you disambiguateand not present in the prompt itself.
-
-## Previous Prompt Attempts
-
-You previously attempted to use the following prompts, but they earned worse scores than the current one:
-<other_attempts>
-{other_attempts}
-</other_attempts>
-
-Reflect on your previous attempts to ensure you search for and identify better patterns.
-
-## Annotated results:
-<results>
-{annotated_results}
-</results>
-
-## Task description:
-<task_description>
-{task_description}
-</task_description>
-
-Unless otherwise specified, higher scores are better (try to maximize scores). Aim for perfect scores across all examples.
-
-In your head, search through all edits, planning the optimization step-by-step:
-1. Analyze the current results and where they fall short
-2. Identify patterns in successful vs unsuccessful cases
-3. Propose specific improvements to address the shortcomings
-4. Generate an improved prompt that maintains all required formatting
-
-The improved prompt must:
-- Keep all original input variables
-- Maintain any special formatting or delimiters
-- Focus on improving the specified metrics
-- Be clear and concise.
-- Avoid repeating mistakes.
-
-Use prompting strategies as appropriate for the task. For logic and math, consider encourage more chain-of-thought reasoning, 
-or include reasoning trajectories to induce better performance. For creative tasks, consider adding style guidelines.
-Or consider including exemplars.
-
-Output your response in this format:
-<analysis>
-Your step-by-step analysis here...
-</analysis>
-
-<improved_prompt>
-Your improved prompt here...
-</improved_prompt>"""
-
-SystemType = Callable[[ChatPromptTemplate, dict], dict]
-"""Takes the current prompt and the example inputs and returns the results."""
+logger = logging.getLogger(__name__)
 
 
-@dataclass(kw_only=True)
-class PromptConfig:
-    identifier: str | None = field(
-        default=None,
-        metadata={
-            "description": "Identifier for a prompt from the hub repository. Mutually exclusive with prompt_str."
-        },
-    )
-    prompt_str: str | None = field(
-        default=None,
-        metadata={
-            "description": "Raw prompt string to optimize locally. Mutually exclusive with identifier."
-        },
-    )
-    model_config: dict | None = field(
-        default=None,
-        metadata={
-            "description": "Configuration dictionary specifying model parameters for optimization."
-        },
-    )
-    which: int = field(
-        default=0,
-        metadata={"description": "Index of the message to optimize within the prompt."},
-    )
-
-    def __post_init__(self):
-        if self.identifier and self.prompt_str:
-            raise ValueError(
-                "Cannot provide both identifier and prompt_str. Choose one."
-            )
-        elif not self.identifier and not self.prompt_str:
-            raise ValueError("Must provide either identifier or prompt_str.")
-
-
-@dataclass(kw_only=True)
-class PromptWrapper(PromptConfig):
-    _cached: ChatPromptTemplate | None = None
-    _postlude: RunnableBinding | BaseChatModel | None = None
-
-    @classmethod
-    def from_config(cls, config: PromptConfig):
-        return cls(
-            identifier=config.identifier,
-            prompt_str=config.prompt_str,
-            model_config=config.model_config,
-            which=config.which,
-        )
-
-    def load(self, client: ls.Client | None = None) -> ChatPromptTemplate:
-        if self._cached is None:
-            if self.prompt_str:
-                self._cached = ChatPromptTemplate.from_messages(
-                    [("user", self.prompt_str)]
-                )
-                self._postlude = init_chat_model(
-                    **(self.model_config or DEFAULT_PROMPT_MODEL_CONFIG)
-                )
-            else:
-                client = client or ls.Client()
-                postlude = None
-                prompt = client.pull_prompt(self.identifier, include_model=True)
-                if isinstance(prompt, RunnableSequence):
-                    prompt, bound_llm = prompt.first, prompt.steps[1]
-                    if isinstance(bound_llm, RunnableBinding):
-                        if tools := bound_llm.kwargs.get("tools"):
-                            bound_llm.kwargs["tools"] = _ensure_stricty(tools)
-                    if isinstance(prompt, StructuredPrompt) and isinstance(
-                        bound_llm, RunnableBinding
-                    ):
-                        seq: RunnableSequence = prompt | bound_llm.bound
-
-                        rebound_llm = seq.steps[1]
-                        if tools := rebound_llm.kwargs.get("tools"):
-                            rebound_llm.kwargs["tools"] = _ensure_stricty(tools)
-                        parser = seq.steps[2]
-                        postlude = RunnableSequence(
-                            rebound_llm.bind(
-                                **{
-                                    **{
-                                        k: v
-                                        for k, v in (bound_llm.kwargs or {}).items()
-                                        if k not in rebound_llm.kwargs
-                                    },
-                                    **(self.model_config or {}),
-                                }
-                            ),
-                            parser,
-                        )
-                    else:
-                        postlude = bound_llm
-                else:
-                    # Default to gpt-4o-mini
-                    postlude = init_chat_model(
-                        **(self.model_config or DEFAULT_PROMPT_MODEL_CONFIG)
-                    )
-                    if isinstance(prompt, StructuredPrompt):
-                        postlude = RunnableSequence(*(prompt | postlude).steps[1:])
-                self._cached = prompt
-                self._postlude = postlude
-        return self._cached
-
-    def get_prompt_str(self, client: ls.Client | None = None) -> str:
-        tmpl = self.load(client)
-        msg = tmpl.messages[self.which]
-        try:
-            return msg.prompt.template  # type: ignore
-        except Exception as e:
-            raise NotImplementedError(
-                f"Unsupported message template format. {msg}"
-            ) from e
-
-    def get_prompt_str_in_context(self, client: ls.Client | None = None) -> str:
-        tmpl = self.load(client)
-        formatted = []
-        for i, msg in enumerate(tmpl.messages):
-            kind = msg.__class__.__name__.replace("MessagePromptTemplate", "").replace(
-                "Human", "User"
-            )
-            if i == self.which:
-                formatted.append(
-                    f"""<TO_OPTIMIZE kind="{kind}">
-{msg.prompt.template}
-</TO_OPTIMIZE>"""
-                )
-            else:
-                formatted.append(
-                    f"""<CONTEXT kind="{kind}">
-{msg.prompt.template}
-</CONTEXT>
-"""
-                )
-        return "\n".join(formatted)
-
-    @classmethod
-    def from_prior(cls, prior: "PromptWrapper", output: str):
-        copied = prior._cached
-        if not copied:
-            raise ValueError("Cannot load from unloaded prior.")
-        copied = copy.deepcopy(copied)
-        tmpl = copied.messages[prior.which]
-        tmpl.prompt.template = output  # type: ignore
-        return cls(
-            identifier=prior.identifier,
-            prompt_str=prior.prompt_str,
-            which=prior.which,
-            _cached=copied,
-            _postlude=prior._postlude,
-        )
-
-    def push_prompt(
-        self,
-        *,
-        identifier: Optional[str] = None,
-        include_model_info: bool = True,
-        client: ls.Client,
-    ) -> str:
-        prompt = self.load(client)
-        identifier = identifier or self.identifier.rsplit(":", maxsplit=1)[0]
-        try:
-            if not include_model_info or not self._postlude:
-                new_id = client.push_prompt(identifier, object=prompt)
-            else:
-                second = (
-                    self._postlude.first
-                    if isinstance(self._postlude, RunnableSequence)
-                    else self._postlude
-                )
-                seq = RunnableSequence(prompt, second)
-                return self._push_seq(client, seq, identifier)
-
-        except LangSmithConflictError:
-            return identifier
-
-        return ":".join(
-            new_id
-            # Remove the https:// prefix
-            .split("/prompts/", maxsplit=1)[1]
-            # Rm query string
-            .split("?")[0]
-            # Split the repo from the commit hash
-            .rsplit("/", maxsplit=1)
-        )
-
-    @staticmethod
-    def _push_seq(client: ls.Client, seq: RunnableSequence, identifier: str):
-        manifest = json.loads(dumps(seq))
-        manifest["id"] = ("langsmith", "playground", "PromptPlayground")
-        return client.push_prompt(identifier, object=manifest)
-
-
-@dataclass(kw_only=True)
-class TaskLike:
-    """Represents a specific task for prompt optimization."""
-
-    name: str
-    """The identifier for the task, used for logging and referencing."""
-    dataset: str
-    """The name of the dataset in LangSmith to be used for training and evaluation."""
-    initial_prompt: PromptConfig
-    """The starting prompt configuration, which will be optimized during the process."""
-    description: str = ""
-    """A detailed explanation of the task's objectives and constraints."""
-    evaluator_descriptions: dict = field(default_factory=dict)
-    """A mapping of evaluator names to their descriptions, used to guide the optimization process."""
-    baseline_experiment: Optional[UUID] = None
-    """The UUID of a previous experiment to use as a baseline for comparison, if available."""
-
-
-@dataclass(kw_only=True)
-class Task(TaskLike):
-    """Represents a specific task for prompt optimization with additional execution details."""
-
-    evaluators: list[Callable[[Run, Example], dict]]
-    """A list of functions that assess the quality of model outputs, each returning a score and optional feedback."""
-    system: Optional[SystemType] = None
-    """A custom system configuration for executing the prompt, allowing for task-specific processing."""
-
-    @classmethod
-    def from_dict(cls, d: dict):
-        d_ = d.copy()
-        kwargs = {"initial_prompt": PromptWrapper(**d_.pop("initial_prompt")), **d_}
-
-        field_names = {f.name for f in fields(cls)}
-        kwargs = {k: v for k, v in kwargs.items() if k in field_names}
-        return cls(**kwargs)
-
-    def describe(self):
-        descript = self.description if self.description else self.name
-        evaluator_desc = "\n".join(
-            [f"- {key}: {value}" for key, value in self.evaluator_descriptions.items()]
-        )
-        return f"{descript}\n\nDescription of scores:\n{evaluator_desc}"
-
-    @staticmethod
-    def get_prompt_system(prompt_wrapper: PromptWrapper):
-        async def prompt_system(prompt: ChatPromptTemplate, inputs: dict):
-            return await prompt_wrapper._postlude.ainvoke(prompt.invoke(inputs))
-
-        return prompt_system
-
-    @property
-    def system_safe(self) -> SystemType:
-        if self.system:
-            return self.system
-
-        prompt = PromptWrapper.from_config(self.initial_prompt)
-        return self.get_prompt_system(prompt)
-
-
-@dataclass(kw_only=True)
-class OptimizerConfig:
-    model: dict = field(
-        metadata={
-            "description": "Model configuration dictionary specifying the model name, parameters, and other settings used during optimization."
-        }
-    )
-
-
-@dataclass(kw_only=True)
-class Config(TaskLike):
-    optimizer: OptimizerConfig | None = field(
-        default=None,
-        metadata={
-            "description": "Optimization configuration specifying model settings and hyperparameters. If None, default configuration will be used."
-        },
-    )
-    evaluators: str = field(
-        metadata={
-            "description": (
-                "Import path to evaluator functions in format 'file_path:variable_name'. The functions should evaluate prompt quality.\n\n"
-                "Example:\n    ./task/evaluators.py:evaluators"
-            )
-        }
-    )
-    system: Optional[str] = field(
-        default=None,
-        metadata={
-            "description": (
-                "Import path to system configuration in format 'file_path:variable_name'. Defines how prompts are executed.\n\n"
-                "Example:\n    ./task/my_system.py:chain"
-            )
-        },
-    )
-
-
-class OptimizedPromptOutput(BaseModel):
-    """Schema for the optimized prompt output."""
-
-    analysis: str = Field(
-        description="First, analyze the current results and plan improvements to reconcile them."
-    )
-    improved_prompt: str = Field(description="The improved prompt text")
-
-
-class PromptOptimizer:
-    """A framework for optimizing meta-prompts through multi-task evaluation."""
+class PromptTrainer:
+    """A framework for optimizing prompts through multi-task evaluation."""
 
     def __init__(
         self,
-        model: BaseChatModel,
-        meta_prompt: Optional[str] = None,
-        seed: int = 42,
+        optimizer: pm_optimizers.BaseOptimizer,
+        algorithm: Optional["BaseAlgorithm"] = None,
+        client: Optional[ls.Client] = None,
+        seed: int = 43,
+        experiment_dir: str = "~",
     ):
-        self.model = model
-        self.client = ls.Client()
-        self.meta_prompt = meta_prompt or DEFAULT_METAPROMPT
+        """Initialize the trainer with a specific optimization algorithm.
+
+        Args:
+            optimizer: The optimization algorithm to use for improving prompts
+            client: Optional LangSmith client. If not provided, a new one will be created
+            seed: Random seed for reproducibility
+        """
+        self.optimizer = optimizer
+        self.client = client or ls.Client()
         random.seed(seed)
         self.rng = random.Random(seed)
+        self.algorithm = algorithm
+        self._loop = asyncio.get_running_loop()
+        self._aqueue: dict[asyncio.Future, Callable[[], Any]] = {}
+        self._task = self._loop.create_task(_run(self._aqueue, weakref.ref(self)))
+        self._experiment_dir = experiment_dir
+        self._threadpool = ContextThreadPoolExecutor(max_workers=1)
+
+    async def wait_for_all(self) -> None:
+        """Wait for all queued tasks to complete."""
+        if self._aqueue:
+            await asyncio.gather(*self._aqueue.keys())
+        self._threadpool.shutdown(wait=True)
 
     @classmethod
-    def from_config(cls, config: dict):
-        cp = config.copy()
-        model_config = cp.pop("model", DEFAULT_OPTIMIZER_MODEL_CONFIG)
-        model = init_chat_model(**model_config)
-        return cls(model, **cp)
+    def from_config(
+        cls, config: dict | pm_config.Config, algo_config: dict, experiment_dir: str
+    ):
+        """Create a PromptTrainer from a configuration dictionary.
 
-    async def optimize_prompt(
+        Args:
+            config: Either a MetaPromptOptimizerConfig or FewShotOptimizerConfig
+        """
+        from promptim import algorithms as pm_algorithms
+
+        if is_dataclass(config):
+            cp = asdict(config)
+        else:
+            cp = config.copy()
+        kind = cp.get("kind") or "metaprompt"
+        optimizer_config = {**cp, "kind": kind}
+        if "model" not in optimizer_config:
+            optimizer_config["model"] = cp.get(
+                "model", pm_types.DEFAULT_OPTIMIZER_MODEL_CONFIG
+            )
+        optimizer = pm_optimizers.load_optimizer(optimizer_config)
+        algorithm = pm_algorithms.load_algorithm(
+            algo_config, optimizer_model=optimizer.model
+        )
+        return cls(
+            optimizer=optimizer, algorithm=algorithm, experiment_dir=experiment_dir
+        )
+
+    def save_config(self) -> dict:
+        return {
+            "optimizer": self.optimizer.config,
+            "algorithm": self.algorithm.config,
+        }
+
+    @ls.traceable(name="Train Prompt")
+    async def train(
         self,
-        task: Task,
+        task: pm_types.Task,
         *,
-        system_config: dict | None = None,
-        train_size: Optional[int] = None,
-        batch_size: int = 40,
-        epochs: int = 1,
-        annotation_queue: str | None = None,
-        debug: bool = False,
+        initial_population: Union[
+            pm_types.PromptWrapper,
+            list[pm_types.PromptWrapper],
+            None,
+            str,
+            dict,
+            pm_types.PromptConfig,
+        ] = None,
+        system_config: Optional[dict] = None,
+        annotation_queue: Optional[str] = None,
         commit_prompts: bool = False,
-    ) -> tuple[PromptWrapper, float]:
-        """Optimizes a prompt for a specific task through multiple iterations."""
-        initial_prompt = PromptWrapper.from_config(task.initial_prompt)
-        if initial_prompt.prompt_str:
-            if commit_prompts:
+        experiment_name: Optional[str] = None,
+    ) -> tuple[pm_types.PromptWrapper, float]:
+        """
+        Delegates the macro-level training flow to the specified algorithm.
+        The trainer still handles data loading, concurrency, experiment creation, etc.
+        """
+        if initial_population is None:
+            initial_population = task.initial_prompt
+        if isinstance(initial_population, pm_types.PromptWrapper):
+            initial_population = [initial_population]
+        elif isinstance(initial_population, (str, dict, pm_types.PromptConfig)):
+            initial_population = pm_types.PromptWrapper.from_config(initial_population)
+
+        # Initialize the prompt(s)
+        for prompt in initial_population:
+            if prompt.prompt_str and commit_prompts:
                 richprint(
                     "[yellow]Warning: No prompt identifier is configured for this run. "
                     "Prompts will not be committed.[/yellow]"
                 )
                 commit_prompts = False
-        if task.system is None:
-            task.system = task.get_prompt_system(initial_prompt)
-        initial_prompt.load(self.client)  # check
-        current_prompt = initial_prompt
-        best_score = 0
-        best_prompt = initial_prompt
-        other_attempts = []
+            if task.system is None:
+                task.system = task.get_prompt_system(prompt)
+            prompt.load(self.client)
+
+        train_examples, dev_examples, test_examples = await self._get_data(
+            initial_population[0], task
+        )
+        experiment_name = experiment_name or f"Prompt Optimization - {task.name}"
+
+        (
+            baseline_scores,
+            baseline_experiment_results,
+        ) = await self._get_baseline_scores(
+            task,
+            train_examples,
+            dev_examples,
+            initial_population[-1],
+            experiment_name=experiment_name,
+            debug=self.algorithm.config.debug,
+            system_config=system_config,
+        )
+        # TODO: fix potential baseline <> population mismatch
+        best_prompt, _ = await self.algorithm.run(
+            trainer=self,
+            task=task,
+            initial_population=initial_population,
+            system_config=system_config,
+            annotation_queue=annotation_queue,
+            train_examples=train_examples,
+            dev_examples=dev_examples,
+            commit_prompts=commit_prompts,
+            experiment_name=experiment_name,
+            baseline_scores=baseline_scores,
+            baseline_experiment_results=baseline_experiment_results,
+        )
+        _, final_test_scores = await self._get_test_scores(
+            task,
+            test_examples,
+            initial_population[0],
+            best_prompt,
+            experiment_name,
+            self.algorithm.config.debug,
+            system_config,
+        )
+        pm_utils.print_rich_diff(
+            initial_population[0].get_prompt_str_in_context(),
+            best_prompt.get_prompt_str_in_context(),
+            title="Final Prompt Updates",
+        )
+        await self.wait_for_all()
+        test_score = statistics.mean(final_test_scores.values())
+        return best_prompt, test_score
+
+    async def optimize_prompt(
+        self,
+        task: pm_types.Task,
+        initial_prompt: Optional[Union[str, dict, pm_types.PromptWrapper]] = None,
+        train_size: Optional[int] = None,
+        batch_size: int = 40,
+        epochs: int = 5,
+        debug: bool = False,
+        system_config: Optional[dict] = None,
+        annotation_queue: Optional[str] = None,
+        commit_prompts: bool = False,
+        experiment_name: Optional[str] = None,
+    ) -> tuple[pm_types.PromptWrapper, float]:
+        """Legacy method that uses MinibatchAlgorithm for backward compatibility."""
+        from .algorithms import AlgorithmConfig, MinibatchAlgorithm
+
+        algo_config = AlgorithmConfig(
+            train_size=train_size,
+            batch_size=batch_size,
+            epochs=epochs,
+            debug=debug,
+        )
+        algo = MinibatchAlgorithm(algo_config)
+
+        if initial_prompt is None:
+            initial_prompt = task.initial_prompt
+        if isinstance(initial_prompt, (str, dict)):
+            initial_prompt = pm_types.PromptWrapper.from_config(initial_prompt)
+
+        return await self.train(
+            task=task,
+            algorithm=algo,
+            initial_population=[initial_prompt],
+            system_config=system_config,
+            annotation_queue=annotation_queue,
+            commit_prompts=commit_prompts,
+            experiment_name=experiment_name,
+        )
+
+    async def _get_data(
+        self, initial_prompt: pm_types.PromptWrapper, task: pm_types.Task
+    ):
         # Print the original prompt
         richprint(
             Panel.fit(
@@ -497,6 +305,13 @@ class PromptOptimizer:
                 progress.console.print(
                     "[yellow]Warning: Using the same examples for train, dev, and test may lead to overfitting.[/yellow]"
                 )
+                if not train_examples:
+                    raise ValueError(
+                        "The dataset is empty. Please provide a non-empty dataset. "
+                        "Ensure that you have correctly specified the dataset name in your config file, "
+                        "and that the dataset has been properly uploaded to LangSmith. "
+                        f"Current dataset name: '{task.dataset}'. "
+                    )
             else:
                 train_examples = sorted(
                     self.client.list_examples(
@@ -532,254 +347,164 @@ class PromptOptimizer:
             train_examples, dev_examples, test_examples = self._validate_split_examples(
                 train_examples, dev_examples, test_examples, progress.console
             )
+
             progress.update(ptsk, advance=1)
 
-        with Progress() as progress:
-            main_task = progress.add_task(
-                "[cyan]Optimizing prompt...", total=epochs + 2
+        return train_examples, dev_examples, test_examples
+
+    async def _get_baseline_scores(
+        self,
+        task: pm_types.Task,
+        train_examples: list[Example],
+        dev_examples: list[Example],
+        current_prompt: pm_types.PromptWrapper,
+        experiment_name: str,
+        debug: bool,
+        system_config: Optional[dict] = None,
+    ) -> tuple[dict[str, float] | None, list[ExperimentResultRow] | None]:
+        # Step 1: Get baseline scores
+        if task.baseline_experiment:
+            return (await self._fetch_baseline_metrics(task.baseline_experiment)), None
+        else:
+            baseline_session = await _queue(
+                self,
+                _create_experiment,
+                client=self.client,
+                dataset_id=train_examples[0].dataset_id,
+                experiment_name=experiment_name + f"- baseline {uuid.uuid4().hex[:6]}",
             )
-
-            # Step 1: Get baseline scores
-            progress.update(
-                main_task, advance=10, description="[cyan]Getting baseline scores..."
-            )
-            if task.baseline_experiment:
-                baseline_scores = await self._fetch_baseline_metrics(
-                    task.baseline_experiment
-                )
-            else:
-                baseline_experiment_results = await self._evaluate_prompt(
-                    current_prompt,
-                    task,
-                    dev_examples,
-                    debug=debug,
-                    system_config=system_config,
-                )
-                baseline_scores = await self.calculate_scores(
-                    baseline_experiment_results
-                )
-            best_score = (
-                sum(baseline_scores.values()) / len(baseline_scores)
-                if baseline_scores
-                else None
-            )
-
-            table = Table(
-                title="Baseline Scores (Dev Set)",
-                show_header=True,
-                header_style="bold magenta",
-            )
-            table.add_column("Metric", style="cyan", no_wrap=True)
-            table.add_column("Score", justify="right", style="green")
-
-            for metric, score in baseline_scores.items():
-                table.add_row(metric, f"{score:.4f}")
-
-            table.add_row("Average", f"{best_score:.4f}", style="bold")
-
-            progress.console.print(
-                Panel(
-                    table,
-                    title="[bold]Initial Prompt Evaluation[/bold]",
-                    border_style="cyan",
-                )
-            )
-            progress.console.print("\n[bold cyan]Beginning optimization.[/bold cyan]")
-            progress.console.print()
-
-            # Step 2: Train
-            progress.update(
-                main_task,
-                advance=1,
-                description="[cyan]Optimizing prompt on epoch 1...",
-            )
-
-            for epoch in range(epochs):
-                self.rng.shuffle(train_examples)
-                if train_size:
-                    train_examples = train_examples[:train_size]
-
-                batches = [
-                    train_examples[i : i + batch_size]
-                    for i in range(0, len(train_examples), batch_size)
-                ]
-
-                batch_task = progress.add_task(
-                    f"[yellow]Epoch {epoch+1} batches", total=len(batches)
-                )
-                all_train_scores = []
-                experiment_name = None
-                avg_score = -1
-                for bix, batch in enumerate(batches):
-                    if (
-                        bix == 0
-                        and epoch == 0
-                        and whole_banana
-                        and baseline_experiment_results
-                    ):
-                        bindices = {e.id for e in batch}
-                        results = [
-                            r
-                            for r in baseline_experiment_results
-                            if r["example"].id in bindices
-                        ]
-                    else:
-                        results = await self._evaluate_prompt(
-                            current_prompt,
-                            task,
-                            batch,
-                            debug=debug,
-                            experiment_name=experiment_name,
-                            system_config=system_config,
-                        )
-                    next_action = "continue"
-                    if annotation_queue:
-                        results, next_action = await self._wait_for_annotation_queue(
-                            results,
-                            annotation_queue,
-                            task,
-                            progress,
-                        )
-                    train_scores = await self.calculate_scores(results)
-                    train_score = (
-                        sum(train_scores.values()) / len(train_scores)
-                        if train_scores
-                        else None
-                    )
-                    all_train_scores.append(train_score)
-                    avg_score = sum(all_train_scores) / len(all_train_scores)
-                    progress.update(
-                        batch_task,
-                        description=f"[yellow]Epoch {epoch+1} (Avg training score: {avg_score:.4f})",
-                    )
-                    improved = await self.apply_metaprompt(
-                        current_prompt=current_prompt,
-                        other_attempts=other_attempts,
-                        meta_prompt=self.meta_prompt,
-                        task=task,
-                        results=results,
-                    )
-                    current_prompt = improved
-                    if commit_prompts:
-                        pushed_id = current_prompt.push_prompt(client=self.client)
-                        progress.console.print(f"See prompt checkpoint: {pushed_id}")
-
-                    progress.update(
-                        batch_task,
-                        advance=1,
-                        description=f"[yellow]Epoch {epoch+1} (Avg Score: {avg_score:.4f})",
-                    )
-                    if next_action != "continue":
-                        break
-                # Evaluate on dev set after each epoch
-                progress.update(main_task, description="[cyan]Evaluating on dev set...")
-                dev_results = await self._evaluate_prompt(
-                    current_prompt,
-                    task,
-                    dev_examples,
-                    debug=debug,
-                    system_config=system_config,
-                )
-                dev_scores = await self.calculate_scores(dev_results)
-                dev_score = (
-                    sum(dev_scores.values()) / len(dev_scores) if dev_scores else None
-                )
-                progress.update(
-                    batch_task,
-                    description=f'[yellow]Epoch {epoch+1} (Dev: {f"{dev_score:.4f}" if dev_score is not None else "-"}, Train: {f"{avg_score:.4f}" if avg_score is not None else "-"})',
-                )
-
-                if dev_score is not None and dev_score > best_score:
-                    if best_prompt not in other_attempts:
-                        other_attempts.append(best_prompt)
-                    best_score = dev_score
-                    best_prompt = current_prompt
-                    progress.console.print(
-                        f"New best score: {best_score:.4f} (surpassed previous best)"
-                    )
-                    progress.console.print("Average of:")
-                    for metric, score in dev_scores.items():
-                        progress.console.print(f"  {metric}: {score:.4f}")
-                else:
-                    other_attempts.append(current_prompt)
-                    current_prompt = best_prompt
-                    progress.console.print(
-                        f"Score {dev_score:.4f} did not surpass best score {best_score:.4f}"
-                    )
-                progress.console.print()
-
-                progress.console.print(
-                    Panel(
-                        f"[bold]Epoch {epoch+1}[/bold]\n"
-                        f"Dev score: [cyan]{dev_score:.4f}[/cyan]\n"
-                        f"Best score: [green]{best_score:.4f}[/green]",
-                        title="Training Progress",
-                        expand=False,
-                        border_style="bold",
-                    )
-                )
-                progress.console.print()
-                progress.update(
-                    main_task,
-                    advance=1,
-                    description="[cyan]Optimizing prompt...",
-                )
-
-            # Step 3: Test
-            progress.update(
-                main_task, advance=10, description="[cyan]Running final tests..."
-            )
-            del train_examples
-            del dev_examples
-
-            initial_test_results = await self._evaluate_prompt(
-                initial_prompt,
+            baseline_experiment_results = await self._evaluate_prompt(
+                current_prompt,
                 task,
-                test_examples,
+                dev_examples,
                 debug=debug,
                 system_config=system_config,
+                experiment=baseline_session,
             )
-            final_test_results = await self._evaluate_prompt(
-                best_prompt,
-                task,
-                test_examples,
-                debug=debug,
-                system_config=system_config,
-            )
-            progress.update(
-                main_task, advance=10, description="[cyan]Optimization complete!"
-            )
+            if experiment_url := _get_url(baseline_session, dev_examples[0].dataset_id):
+                print(f"See baseline experiment at: {experiment_url}")
+
+            return (
+                await self.calculate_scores(baseline_experiment_results)
+            ), baseline_experiment_results
+
+    async def _get_test_scores(
+        self,
+        task: pm_types.Task,
+        test_examples: list[Example],
+        initial_prompt: pm_types.PromptWrapper,
+        best_prompt: pm_types.PromptWrapper,
+        experiment_name: str,
+        debug: bool,
+        system_config: Optional[dict] = None,
+        num_repetitions: int = 5,
+    ):
+        test_baseline_session_fut = self._enqueue_experiment(
+            experiment_name=experiment_name,
+            examples=test_examples,
+            split="test",
+            metadata={"which": "baseline"},
+        )
+        test_final_session_fut = self._enqueue_experiment(
+            experiment_name=experiment_name,
+            examples=test_examples,
+            split="test",
+            metadata={"which": "final"},
+        )
+
+        initial_test_results = await self._evaluate_prompt(
+            initial_prompt,
+            task,
+            test_examples,
+            debug=debug,
+            system_config=system_config,
+            experiment=await test_baseline_session_fut,
+            num_repetitions=num_repetitions,
+        )
+        final_test_results = await self._evaluate_prompt(
+            best_prompt,
+            task,
+            test_examples,
+            debug=debug,
+            experiment=await test_final_session_fut,
+            system_config=system_config,
+            num_repetitions=num_repetitions,
+        )
         # Print final report
-        initial_scores = await self.calculate_scores(initial_test_results)
-        final_scores = await self.calculate_scores(final_test_results)
+        initial_scores, initial_stdev, initial_ci = await self.calculate_scores(
+            initial_test_results, ci=True
+        )
+        final_scores, final_stdev, final_ci = await self.calculate_scores(
+            final_test_results, ci=True
+        )
 
         table = Table(
-            title="Optimization Results", show_header=True, header_style="bold magenta"
+            title="Optimization Results Test",
+            show_header=True,
+            header_style="bold magenta",
         )
         table.add_column("Metric", style="cyan", no_wrap=True)
         table.add_column("Initial Score", justify="right", style="green")
         table.add_column("Final Score", justify="right", style="green")
 
         for metric in initial_scores.keys():
+            initial_std = initial_stdev.get(metric, (None, None))
+            final_std = final_stdev.get(metric, (None, None))
             table.add_row(
-                metric, f"{initial_scores[metric]:.4f}", f"{final_scores[metric]:.4f}"
+                metric,
+                f"{initial_scores[metric]:.4f} ({initial_std[0]:.4f}-{initial_std[1]:.4f})",
+                f"{final_scores[metric]:.4f} ({final_std[0]:.4f}-{final_std[1]:.4f})",
             )
-
+        initial_average = sum(initial_scores.values()) / len(initial_scores)
+        final_average = sum(final_scores.values()) / len(final_scores)
+        initial_lower, initial_upper = initial_ci
+        final_lower, final_upper = final_ci
+        table.add_row(
+            "Average",
+            f"{initial_average:.4f} ({initial_lower:.4f}-{initial_upper:.4f})",
+            f"{final_average:.4f} ({final_lower:.4f}-{final_upper:.4f})",
+        )
         richprint(Panel(table, title="Final Report", border_style="bold"))
 
-        # Print prompt diff
-        _print_rich_diff(
-            initial_prompt.get_prompt_str_in_context(),
-            best_prompt.get_prompt_str_in_context(),
-            title="Final Prompt Updates",
+        self.log_metric(
+            "score",
+            value=initial_average,
+            x=0,
+            x_label="base",
+            split="test",
+            bounds=(initial_ci[0], initial_ci[1]),
+            prompt=initial_prompt,
         )
-        return best_prompt, best_score
+        self.log_metric(
+            "score",
+            value=final_average,
+            x=0,
+            x_label="final",
+            split="test",
+            bounds=(final_ci[0], final_ci[1]),
+            prompt=best_prompt,
+        )
+        tokens_used = pm_utils.get_token_usage()
+        if tokens_used is not None:
+            self.log_metric(
+                "score",
+                value=final_average,
+                x=tokens_used,
+                x_label="total tokens",
+                split="dev",
+                bounds=(final_ci[0], final_ci[1]),
+                prompt=best_prompt,
+            )
+        return (
+            initial_scores,
+            final_scores,
+        )
 
     async def _wait_for_annotation_queue(
         self,
         results: list[ExperimentResultRow],
         queue_name: str,
-        task: Task,
+        task: pm_types.Task,
         progress: Progress,
     ) -> tuple[list[ExperimentResultRow], Literal["continue"]]:
         """Add runs to the queue and block to let a reviewer check the outputs and leave feedback."""
@@ -873,120 +598,181 @@ class PromptOptimizer:
 
         return list(results_dict.values()), user_input
 
+    @ls.traceable(process_outputs=lambda _: {})
     async def _evaluate_prompt(
         self,
-        prompt_config: PromptWrapper,
-        task: Task,
+        prompt_config: pm_types.PromptWrapper,
+        task: pm_types.Task,
         data: str | list,
         debug: bool = False,
-        experiment_name: str | None = None,
+        experiment: str | TracerSession | None = None,
         system_config: dict | None = None,
+        num_repetitions: int = 1,
+        upload_results: bool = True,
     ) -> list[ExperimentResultRow]:
         """Evaluates a prompt against a task's dataset and evaluators."""
         prompt = prompt_config.load(self.client)
         metadata = {
             "prompt": prompt_config.identifier if prompt_config.identifier else "local"
         }
+        rt = ls.get_current_run_tree()
 
         async def predict(inputs: dict):
-            if system_config:
-                return await task.system_safe(prompt, inputs, **system_config)
-            else:
-                return await task.system_safe(prompt, inputs)
+            stack = AsyncExitStack()
+            prt = None
+            if not upload_results:
+                prt = await stack.enter_async_context(
+                    ls.trace("predict", inputs=inputs, parent=rt)
+                )
+            async with stack:
+                if system_config:
+                    result = await task.system_safe(prompt, inputs, **system_config)
+                else:
+                    result = await task.system_safe(prompt, inputs)
+                if prt is not None:
+                    if isinstance(result, dict):
+                        prt.add_outputs(result)
+                    else:
+                        prt.add_outputs({"output": result})
+            return result
 
-        results = await ls.aevaluate(
-            predict,
-            data=data,
-            evaluators=task.evaluators,
-            max_concurrency=0 if debug else None,
-            experiment=experiment_name,
-            experiment_prefix="Optimizer",
-            metadata=metadata,
-        )
+        with ls.tracing_context(parent={"langsmith-trace": ""}):
+            results = await ls.aevaluate(
+                predict,
+                data=data,
+                evaluators=task.evaluators,
+                max_concurrency=0 if debug else None,
+                experiment=experiment,
+                experiment_prefix="Optimizer" if not experiment else None,
+                num_repetitions=num_repetitions,
+                metadata=metadata,
+                upload_results=upload_results,
+            )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if results._manager._experiment is not None:
+            await _queue(
+                self,
+                self.client.update_project,
+                project_id=results._manager._experiment.id,
+                end_time=now + datetime.timedelta(days=999),
+            )
+
         return [r async for r in results]
 
+    @overload
     async def calculate_scores(
-        self, results: list[ExperimentResultRow]
+        self, results: list[ExperimentResultRow], ci: Literal[True] = True
+    ) -> tuple[dict[str, float], dict[str, tuple[float, float]], tuple[float, float]]:
+        """Calculates aggregate scores from evaluation results, grouped by key."""
+
+    @overload
+    async def calculate_scores(
+        self, results: list[ExperimentResultRow], ci: Literal[False] = False
     ) -> dict[str, float]:
         """Calculates aggregate scores from evaluation results, grouped by key."""
 
-        scores = defaultdict(list)
+    @ls.traceable(process_inputs=lambda _: {})
+    async def calculate_scores(
+        self,
+        results: list[ExperimentResultRow],
+        ci: bool = False,
+    ) -> Union[
+        dict[str, float],
+        tuple[dict[str, float], dict[str, tuple[float, float]], tuple[float, float]],
+    ]:
+        """
+        Calculate and return:
+          - If ci=False: {key: mean_score}
+          - If ci=True : ( {key: mean_score},
+                           {key: (lower, upper)},
+                           (global_lower, global_upper) )
+        Where "global" means combining all data across all keys into a single distribution or proportion.
+        """
+
+        scores_dict = defaultdict(list)
+        all_scores = []
+
         for result in results:
             for res in result["evaluation_results"]["results"]:
                 if res.score is not None:
-                    scores[res.key].append(res.score)
+                    scores_dict[res.key].append(res.score)
+                    all_scores.append(res.score)
 
-        return {
-            key: sum(values) / len(values) if values else 0.0
-            for key, values in scores.items()
-        }
+        means = {}
+        cintervals = {}
 
-    async def apply_metaprompt(
+        for key, vals in scores_dict.items():
+            if len(vals) == 0:
+                means[key] = 0.0
+                if ci:
+                    cintervals[key] = (0.0, 0.0)
+                continue
+
+            is_binomial = all(v in (0, 1) for v in vals)
+            mean_ = statistics.mean(vals)
+            means[key] = mean_
+
+            if ci:
+                if is_binomial:
+                    x = sum(vals)
+                    n = len(vals)
+                    lower, upper = _wilson_score_interval(x, n)
+                else:
+                    lower, upper = _continuous_confidence_interval(vals)
+                cintervals[key] = (lower, upper)
+
+        if not ci:
+            return means
+
+        if len(all_scores) == 0:
+            global_ci = (0.0, 0.0)
+        else:
+            all_binomial = all(v in (0, 1) for v in all_scores)
+            if all_binomial:
+                x = sum(all_scores)
+                n = len(all_scores)
+                global_ci = _wilson_score_interval(x, n)
+            else:
+                global_ci = _continuous_confidence_interval(all_scores)
+
+        return (means, cintervals, global_ci)
+
+    def log_metric(
         self,
-        current_prompt: PromptWrapper,
-        meta_prompt: str,
-        task: Task,
-        results: list[ExperimentResultRow],
-        other_attempts: list | None = None,
-    ) -> PromptWrapper:
-        annotated_results = self._format_results(results)
-        return await self._generate_improved_prompt(
-            current_prompt,
-            meta_prompt,
-            annotated_results,
-            task,
-            other_attempts=other_attempts,
+        metric_name: str,
+        /,
+        value: float,
+        x: int | float,
+        x_label: str = "epoch",
+        split: str = "dev",
+        bounds: tuple[float, float] | None = None,
+        prompt: pm_types.PromptWrapper | None = None,
+    ):
+        self._threadpool.submit(
+            self._log_metric, metric_name, value, x, x_label, split, bounds, prompt
         )
 
-    def _format_results(self, results: list[ExperimentResultRow]) -> str:
-        """Formats evaluation results for inclusion in the meta-prompt."""
-        formatted = []
-        i = 0
-        for result in results:
-            formatted.append(f"Example {i+1}:")
-            formatted.append(f'Input: {result["run"].inputs}')
-            formatted.append(f'Output: {result["run"].outputs}')
-            formatted.append("Evaluations:")
-            for eval in result["evaluation_results"]["results"]:
-                formatted.append(f"- {eval.key}: {eval.score}")
-                if eval.comment:
-                    formatted.append(f"  Comment: {eval.comment}")
-            formatted.append("")
-            i += 1
-        return "\n".join(formatted)
-
-    async def _generate_improved_prompt(
+    def _log_metric(
         self,
-        current_prompt: PromptWrapper,
-        meta_prompt: str,
-        annotated_results: str,
-        task: Task,
-        other_attempts: list | None = None,
-    ) -> PromptWrapper:
-        """Generates an improved prompt using the meta-prompt."""
-        chain = self.model.with_structured_output(OptimizedPromptOutput)
-        inputs = meta_prompt.format(
-            current_prompt=current_prompt.get_prompt_str_in_context(self.client),
-            annotated_results=annotated_results,
-            task_description=task.describe(),
-            other_attempts=(
-                "\n\n---".join([p.get_prompt_str() for p in other_attempts])
-                if other_attempts
-                else "N/A"
-            ),
-        )
-        prompt_output: OptimizedPromptOutput = await chain.ainvoke(inputs)
-        candidate = PromptWrapper.from_prior(
-            current_prompt, prompt_output.improved_prompt
-        )
-
-        _print_rich_diff(
-            current_prompt.get_prompt_str_in_context(self.client),
-            candidate.get_prompt_str_in_context(self.client),
-            "Updated Prompt",
-        )
-
-        return candidate
+        metric_name: str,
+        value: float,
+        x: int | float,
+        x_label: str = "epoch",
+        split: str = "dev",
+        bounds: tuple[float, float] | None = None,
+        prompt: pm_types.PromptWrapper | None = None,
+    ):
+        fname = os.path.join(self._experiment_dir, "metrics.csv")
+        nexist = not os.path.exists(fname)
+        with open(fname, "a", newline="") as f:
+            writer = csv.writer(f)
+            if nexist:
+                writer.writerow(
+                    ["x", "y", "x_label", "metric", "split", "lower", "upper", "prompt"]
+                )
+            ps = prompt.dumps(push=True) if prompt else ""
+            lower, upper = bounds or ("", "")
+            writer.writerow([x, value, x_label, metric_name, split, lower, upper, ps])
 
     async def _fetch_baseline_metrics(self, experiment_id: UUID) -> dict:
         """Fetches metrics for a baseline experiment."""
@@ -996,6 +782,29 @@ class PromptOptimizer:
             col for col in test_results.columns if col.startswith("feedback.")
         ]
         return {col: test_results[col].mean() for col in metric_cols}
+
+    def _enqueue_experiment(
+        self,
+        experiment_name: str,
+        examples: list[Example],
+        split: str,
+        epoch: int | None = None,
+        metadata: dict | None = None,
+    ):
+        metadata = metadata or {}
+        if epoch is not None:
+            metadata["epoch"] = epoch
+        return _queue(
+            self,
+            _create_experiment,
+            client=self.client,
+            dataset_id=examples[0].dataset_id,
+            experiment_name=experiment_name + f" - {split} [epoch {epoch}]",
+            metadata={
+                "split": split,
+                **metadata,
+            },
+        )
 
     @staticmethod
     def _validate_split_examples(
@@ -1025,38 +834,268 @@ class PromptOptimizer:
         return train_examples, dev_examples, test_examples
 
 
-def _colorize_diff(diff):
-    for op, i1, i2, j1, j2 in diff.get_opcodes():
-        if op == "equal":
-            yield diff.a[i1:i2]
-        elif op == "insert":
-            yield f"[green]{diff.b[j1:j2]}[/green]"
-        elif op == "delete":
-            yield f"[red]{diff.a[i1:i2]}[/red]"
-        elif op == "replace":
-            yield f"[red]{diff.a[i1:i2]}[/red][green]{diff.b[j1:j2]}[/green]"
+class PromptOptimizer(PromptTrainer):
+    """Legacy wrapper for backward compatibility that uses the MetaPromptOptimizer."""
+
+    def __init__(
+        self,
+        model: BaseChatModel,
+        meta_prompt: Optional[str] = None,
+        seed: int = 42,
+    ):
+        optimizer = pm_optimizers.MetaPromptOptimizer(
+            model=model,
+            meta_prompt=meta_prompt or pm_types.DEFAULT_METAPROMPT,
+        )
+        super().__init__(optimizer=optimizer, seed=seed)
+        self.model = model  # For backward compatibility
+        self.meta_prompt = meta_prompt or pm_types.DEFAULT_METAPROMPT
+
+    @classmethod
+    def from_config(cls, config: dict):
+        """Legacy config method that assumes metaprompt optimizer."""
+        cp = config.copy()
+        model_config = cp.pop("model", pm_types.DEFAULT_OPTIMIZER_MODEL_CONFIG)
+        model = init_chat_model(**model_config)
+        meta_prompt = cp.pop("meta_prompt", None)
+        return cls(model=model, meta_prompt=meta_prompt, **cp)
+
+    async def apply_metaprompt(
+        self,
+        current_prompt: pm_types.PromptWrapper,
+        meta_prompt: str,
+        task: pm_types.Task,
+        results: list[ExperimentResultRow],
+        other_attempts: list | None = None,
+    ) -> pm_types.PromptWrapper:
+        """Legacy method for backward compatibility."""
+        return await self.optimizer.improve_prompt(
+            current_prompt=current_prompt,
+            results=results,
+            task=task,
+            other_attempts=other_attempts or [],
+        )
 
 
-def _print_rich_diff(original: str, updated: str, title: str = "") -> None:
-    diff = SequenceMatcher(None, original, updated)
-    colorized_diff = "".join(_colorize_diff(diff))
-    panel = Panel(
-        colorized_diff, title=title or "Prompt Diff", expand=False, border_style="bold"
+T = TypeVar("T")
+SyncOrAsyncCallable = Union[Callable[[], T], Callable[[], Coroutine[Any, Any, T]]]
+
+
+def _get_url(project: Any, dataset_id: str) -> None | str:
+    if project and project.url:
+        project_url = project.url.split("?")[0]
+        base_url = project_url.split("/projects/p/")[0]
+        return (
+            f"{base_url}/datasets/{dataset_id}/compare?"
+            f"selectedSessions={project.id}"
+        )
+
+
+def _create_experiment(
+    client: ls.Client,
+    dataset_id: str,
+    experiment_name: str,
+    description: str | None = None,
+    metadata: dict | None = None,
+):
+    """Create a new experiment with an incrementing index in the name.
+
+    The naming scheme is: "{experiment_name} [idx]" where idx starts at 1
+    and increments for each existing experiment with the same base name.
+    """
+    from langsmith import utils as ls_utils
+
+    # Find existing experimens with the same base name
+    existing = list(
+        client.list_projects(
+            reference_dataset_id=dataset_id,
+            name_contains=experiment_name,
+            metadata={"__creation_source": "promptim"},
+        )
     )
-    richprint(panel)
+
+    # Extract indices from existing names
+    indices = []
+    for p in existing:
+        try:
+            if p.name.startswith(experiment_name):
+                # Extract [idx] from the end if it exists
+                if match := p.name.strip().split(" ")[-1]:
+                    if match.startswith("[") and match.endswith("]"):
+                        try:
+                            idx = int(match[1:-1])
+                            indices.append(idx)
+                        except ValueError:
+                            continue
+        except (ValueError, IndexError):
+            continue
+
+    # Get next available index
+    next_idx = max(indices, default=-1) + 1
+
+    # Create new experiment name with index
+    new_name = f"{experiment_name} [{next_idx}]"
+
+    num_attempts = 10
+    for attempt in range(num_attempts):
+        try:
+            return client.create_project(
+                new_name,
+                description=description,
+                reference_dataset_id=dataset_id,
+                metadata={"__creation_source": "promptim", **(metadata or {})},
+            )
+        except ls_utils.LangSmithConflictError:
+            # If there's a conflict, increment the index and try again
+            next_idx += 1
+            new_name = f"{experiment_name} [{next_idx}-{uuid.uuid4().hex[:4]}]"
+    raise ValueError(
+        f"Could not find a unique experiment name ({experiment_name})in {num_attempts} attempts."
+        " Please try again with a different experiment name."
+    )
 
 
-def _ensure_stricty(tools: list) -> list:
-    result = []
-    for tool in tools:
-        if isinstance(tool, dict):
-            strict = None
-            if func := tool.get("function"):
-                if parameters := func.get("parameters"):
-                    if "strict" in parameters:
-                        strict = parameters["strict"]
-            if strict is not None:
-                tool = copy.deepcopy(tool)
-                tool["function"]["strict"] = strict
-        result.append(tool)
-    return result
+def _queue(trainer, func: SyncOrAsyncCallable[T], *args, **kwargs) -> asyncio.Future[T]:
+    """Queue a function to be executed by the trainer.
+
+    Args:
+        func: Function to execute, can be sync or async
+
+    Returns:
+        Future that will contain the result of the function
+    """
+    fut = trainer._loop.create_future()
+    trainer._aqueue[fut] = functools.partial(func, *args, **kwargs)
+    return fut
+
+
+async def _run(
+    aqueue: dict[asyncio.Future[T], SyncOrAsyncCallable[T]],
+    trainer_ref: weakref.ReferenceType["PromptTrainer"],
+) -> None:
+    """Run queued functions, either sync or async, in order."""
+    loop = asyncio.get_running_loop()
+
+    while True:
+        await asyncio.sleep(0)
+
+        if not aqueue:
+            continue
+
+        trainer = trainer_ref() if trainer_ref is not None else None
+        if trainer is None:
+            break
+
+        current_batch = aqueue.copy()
+
+        try:
+            results = []
+            for fut, func in current_batch.items():
+                try:
+                    if asyncio.iscoroutinefunction(func):
+                        result = await func()
+                    else:
+                        result = await loop.run_in_executor(None, func)
+                    results.append((fut, result))
+                except Exception as e:
+                    fut.set_exception(e)
+                    del aqueue[fut]
+
+            for fut, result in results:
+                fut.set_result(result)
+                del aqueue[fut]
+
+        except Exception as e:
+            for fut in current_batch:
+                if not fut.done():
+                    fut.set_exception(e)
+                if fut in aqueue:
+                    del aqueue[fut]
+
+
+def _z_value_for_conf() -> float:
+    # For alpha 0.05 lol
+    return 1.96
+
+
+T_CRITICAL_VALUES = {
+    2: 12.706,
+    3: 4.303,
+    4: 3.182,
+    5: 2.776,
+    6: 2.571,
+    7: 2.447,
+    8: 2.365,
+    9: 2.306,
+    10: 2.262,
+    11: 2.228,
+    12: 2.201,
+    13: 2.179,
+    14: 2.160,
+    15: 2.145,
+    16: 2.131,
+    17: 2.120,
+    18: 2.110,
+    19: 2.101,
+    20: 2.093,
+    21: 2.086,
+    22: 2.080,
+    23: 2.074,
+    24: 2.069,
+    25: 2.064,
+    26: 2.060,
+    27: 2.056,
+    28: 2.052,
+    29: 2.048,
+    30: 2.045,
+}
+
+
+def _t_value_for_conf(n: int) -> float:
+    """
+    Returns the t critical value for alpha (default=0.05 => ~95% CI)
+    with df = n - 1. Uses precomputed lookup for n <= 30.
+    """
+    if n <= 1:
+        return float("inf")
+    if n <= 30:
+        return T_CRITICAL_VALUES.get(n, float("inf"))
+    # Fallback approximation for n > 30 (as t approaches z value ~1.96 for 95% CI)
+    return 1.96
+
+
+def _continuous_confidence_interval(values: list[float]) -> tuple[float, float]:
+    """
+    Uses a t-based approach if n <= 30, else z-based for "large" n.
+    Returns (lower, upper).
+    """
+
+    n = len(values)
+    if n == 0:
+        return (0.0, 0.0)
+    mean_ = statistics.mean(values)
+    if n == 1:
+        return (mean_, mean_)  # Degenerate case
+
+    stdev_ = statistics.stdev(values)
+    t_crit = _t_value_for_conf(n)
+    margin = t_crit * (stdev_ / math.sqrt(n))
+    return (mean_ - margin, mean_ + margin)
+
+
+def _wilson_score_interval(x: int, n: int) -> tuple[float, float]:
+    """
+    Wilson interval for binomial data, default 95% confidence (alpha=0.05).
+    """
+    import math
+
+    if n == 0:
+        return (0.0, 0.0)
+    z = 1.96
+    p_hat = x / n
+    denom = 1 + z**2 / n
+    center = p_hat + z**2 / (2 * n)
+    main = z * math.sqrt((p_hat * (1 - p_hat) + z**2 / (4 * n)) / n)
+    lower = (center - main) / denom
+    upper = (center + main) / denom
+    return (lower, upper)

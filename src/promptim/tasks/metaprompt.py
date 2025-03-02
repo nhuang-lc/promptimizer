@@ -6,7 +6,8 @@ from promptim.tasks.scone import scone_task
 from promptim.tasks.simpleqa import simpleqa_task
 from promptim.tasks.ticket_classification import ticket_classification_task
 from promptim.tasks.tweet_generator import tweet_task
-from promptim.trainer import DEFAULT_METAPROMPT, PromptOptimizer, PromptWrapper, Task
+from promptim.optimizers import metaprompt as metaprompt_optimizer
+from promptim import types as pm_types, trainer as pm_trainer
 
 DEFAULT_METAMETAPROMPT = """You are an expert in prompt optimization systems. Your task is to improve the effectiveness of prompt optimization prompts - the prompts used to guide the improvement of task-specific prompts.
 
@@ -54,10 +55,12 @@ The enhanced prompt for optimizing task-specific prompts
 </improved_optimization_prompt>"""
 
 
-class MetapromptSystem:
+class MetaPromptSystem:
     """System for running the metaprompt optimization task."""
 
-    def __init__(self, task_map: dict[str, Task], meta_prompt: PromptWrapper):
+    def __init__(
+        self, task_map: dict[str, pm_types.Task], meta_prompt: pm_types.PromptWrapper
+    ):
         from langchain.chat_models import init_chat_model
 
         self.task_map = task_map
@@ -68,7 +71,9 @@ class MetapromptSystem:
         except Exception:
             self.model = init_chat_model()
 
-        self.trainer = PromptOptimizer(self.model, meta_prompt.get_prompt_str())
+        self.trainer = pm_trainer.PromptOptimizer(
+            self.model, meta_prompt.get_prompt_str()
+        )
 
     async def __call__(self, prompt: ChatPromptTemplate, inputs: dict) -> dict:
         task = self.task_map[inputs["task"]]
@@ -84,16 +89,17 @@ class MetapromptSystem:
         dev_batch = list(
             self.trainer.client.list_examples(example_ids=inputs["dev_batch"])
         )
-        initial_results = [
-            r
-            async for r in (
-                await ls.aevaluate(
-                    predict,
-                    data=train_batch,
-                    evaluators=task.evaluators,
+        with ls.tracing_context(parent={"langsmith-trace": ""}):
+            initial_results = [
+                r
+                async for r in (
+                    await ls.aevaluate(
+                        predict,
+                        data=train_batch,
+                        evaluators=task.evaluators,
+                    )
                 )
-            )
-        ]
+            ]
         task.initial_prompt.get_prompt_str()
 
         # Generate new downstream task prompt
@@ -106,31 +112,33 @@ class MetapromptSystem:
 
         # Now we actually evaluate based on how well the updated prompt's "improvements"
         # translate to a dev batch
-        initial_dev_results = [
-            r
-            async for r in (
-                await ls.aevaluate(
-                    predict,
-                    data=dev_batch,
-                    evaluators=task.evaluators,
+        with ls.tracing_context(parent={"langsmith-trace": ""}):
+            initial_dev_results = [
+                r
+                async for r in (
+                    await ls.aevaluate(
+                        predict,
+                        data=dev_batch,
+                        evaluators=task.evaluators,
+                    )
                 )
-            )
-        ]
+            ]
         initial_dev_scores = await self.trainer.calculate_scores(initial_dev_results)
 
         async def predict_new(example_inputs: dict):
             return await task.system_safe(extracted._cached, example_inputs)
 
-        new_results = [
-            r
-            async for r in (
-                await ls.aevaluate(
-                    predict_new,
-                    data=dev_batch,
-                    evaluators=task.evaluators,
+        with ls.tracing_context(parent={"langsmith-trace": ""}):
+            new_results = [
+                r
+                async for r in (
+                    await ls.aevaluate(
+                        predict_new,
+                        data=dev_batch,
+                        evaluators=task.evaluators,
+                    )
                 )
-            )
-        ]
+            ]
         new_scores = await self.trainer.calculate_scores(new_results)
         return {
             "original_prompt": task.initial_prompt,
@@ -164,9 +172,11 @@ def metaprompt_evaluator(run, example):
     }
 
 
-prompt_config = PromptWrapper(prompt_str=DEFAULT_METAPROMPT)
-metaprompt_task = Task(
-    name="Metaprompt Optimizer",
+prompt_config = pm_types.PromptWrapper(
+    prompt_str=metaprompt_optimizer.DEFAULT_METAPROMPT
+)
+metaprompt_task = pm_types.Task(
+    name="MetaPrompt Optimizer",
     description="A meta-optimization task that aims to improve the prompt used for optimizing task-specific prompts. This task evaluates and enhances the effectiveness of the prompt optimization process itself, leading to better performance across various language tasks.",
     dataset="metaprompt-optim",
     initial_prompt=prompt_config,
@@ -174,7 +184,7 @@ metaprompt_task = Task(
     evaluator_descriptions={
         "metaprompt_improvement": "Checks if the new prompt leads to improved scores. 1 if better, 0.5 if same, 0 if worse."
     },
-    system=MetapromptSystem(
+    system=MetaPromptSystem(
         {
             "scone": scone_task,
             "tweet": tweet_task,

@@ -1,0 +1,19 @@
+{
+  "name": "math_word_problems",
+  "dataset": "https://smith.langchain.com/public/dd06b406-c37e-429e-8274-db4e9bc832ef/d",
+  "description": "Solve math word problems",
+  "evaluators": "./evaluators.py:correctness_evaluator",
+  "evaluator_descriptions": {
+    "correctness": "Evaluates if the predicted answer equals the reference answer"
+  },
+  "optimizer": {
+    "model": {
+      "model": "claude-3-5-sonnet-20241022"
+    }
+  },
+  "initial_prompt": {
+    "identifier": "langchain-ai/math_word_problems:47c8c36d",
+    "upload_to": "math_word_problems"
+  },
+  "$schema": "https://raw.githubusercontent.com/hinthornw/promptimizer/refs/heads/main/config-schema.json"
+}

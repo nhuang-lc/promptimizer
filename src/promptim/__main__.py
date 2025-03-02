@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import functools
 import importlib.util
 import json
 import os
 import sys
 import time
 from typing import TYPE_CHECKING, Optional
+from datetime import datetime, timezone
 
 import click
 import langsmith as ls
 from langsmith.utils import LangSmithNotFoundError
+import inspect
 
 if TYPE_CHECKING:
     from langsmith import Client
@@ -33,12 +37,12 @@ def get_tasks(task_name: str):
     return tasks.get(task_name)
 
 
-def load_task(name_or_path: str):
-    from promptim.trainer import Task
+def _load_task(name_or_path: str):
+    from promptim.types import Task
 
     task = get_tasks(name_or_path)
     if task:
-        return task, {}
+        return task, {}, "~"
     # If task is not in predefined tasks, try to load from file
     try:
         with open(name_or_path, "r", encoding="utf-8") as f:
@@ -46,26 +50,79 @@ def load_task(name_or_path: str):
         if "$schema" in config:
             del config["$schema"]
         evaluators_path = config["evaluators"]
+
         module_path, evaluators_variable = [
             part for part in evaluators_path.split(":") if part
         ]
+        if ".py" not in module_path:
+            # Assume it's like "my.module.path:fooo"
+            # and convert it to "my/module/path/foo.py"
+            module_path = module_path.replace(".", "/")
+            module_path += ".py"
         # First try to load it relative to the config path
         config_dir = os.path.dirname(name_or_path)
         relative_module_path = os.path.join(config_dir, module_path)
         if os.path.exists(relative_module_path):
             module_path = relative_module_path
+        else:
+            relative_module_path = os.path.join(
+                os.path.dirname(config_dir), module_path
+            )
+            if os.path.exists(relative_module_path):
+                module_path = relative_module_path
+        if not os.path.exists(module_path):
+            raise ValueError(f"Could not find evaluator module {module_path}")
         spec = importlib.util.spec_from_file_location("evaluators_module", module_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         evaluators = getattr(module, evaluators_variable)
+        if inspect.isfunction(evaluators):
+            evaluators = [evaluators]
         if not isinstance(evaluators, list):
             raise ValueError(
                 f"Expected evaluators to be a list, but got {type(evaluators).__name__}"
             )
         task = Task.from_dict({**config, "evaluators": evaluators})
-        return task, config
+        return task, config, os.path.join(os.path.dirname(name_or_path), "~")
     except Exception as e:
         raise ValueError(f"Could not load task from {name_or_path}: {e}")
+
+
+@functools.lru_cache
+def load_task(name_or_path: str):
+    task, config, experiment_parent = _load_task(name_or_path)
+    if (
+        "dataset" in config
+        and isinstance(config["dataset"], dict)
+        and "url" in config["dataset"]
+    ):
+        dataset_url = config["dataset"]["url"]
+        dataset_name = config["dataset"]["name"]
+    elif task.dataset.startswith("https://"):
+        dataset_url = task.dataset
+        dataset_name = None
+    else:
+        dataset_url = None
+        dataset_name = None
+    if dataset_url:
+        ls_client = ls.Client()
+        ds = ls_client.read_shared_dataset(dataset_url.split("/")[-2])
+        dataset_url = ds.url
+        dataset_name = ds.name
+        config["dataset"] = dataset_name
+        task.dataset = dataset_name
+    #     ds = ls_client.clone_public_dataset(dataset_url, dataset_name=dataset_name)
+    #     examples = list(ls_client.list_shared_examples(dataset_url.split("/")[-2]))
+    #     copied_examples = list(ls_client.list_examples(dataset_id=ds.id))
+    #     splits = [(e.metadata or {}).get("dataset_split", ["train"]) for e in examples]
+    #     ls_client.update_examples(
+    #         example_ids=[e.id for e in copied_examples],
+    #         splits=splits,
+    #         dataset_ids=[ds.id] * len(examples),
+    #     )
+    #     config["dataset"] = ds.name
+    #     task.dataset = ds.name
+    return task, config, experiment_parent
 
 
 async def run(
@@ -76,32 +133,60 @@ async def run(
     annotation_queue: Optional[str] = None,
     debug: bool = False,
     commit: bool = True,
+    patch: dict | None = None,
 ):
-    task, config = load_task(task_name)
-    from promptim.trainer import PromptOptimizer
+    task, config, experiment_parent = load_task(task_name)
+    if patch:
+        from promptim.types import PromptWrapper
 
-    optimizer = PromptOptimizer.from_config(
-        config.get("optimizer", config.get("optimizer_config", {}))
+        config = deep_merge(config, patch)
+        task.initial_prompt = PromptWrapper.from_config(config["initial_prompt"])
+    experiment_dir = os.path.join(
+        experiment_parent,
+        f"exp-{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H-%M-%S')}",
+    )
+    os.makedirs(experiment_dir, exist_ok=True)
+
+    from promptim.trainer import PromptTrainer
+
+    algo_config = {
+        "batch_size": batch_size,
+        "train_size": train_size,
+        "epochs": epochs,
+        "debug": debug,
+    } | (config.get("algorithm") or {})
+
+    with open(os.path.join(experiment_dir, "config.json"), "w", encoding="utf-8") as f:
+        config_print = json.dumps(
+            {
+                **config,
+                "algorithm": algo_config,
+            },
+            indent=2,
+        )
+        f.write(config_print)
+        print(f"Experiment: {experiment_dir}")
+        print(config_print)
+
+    optimizer = PromptTrainer.from_config(
+        config.get("optimizer", config.get("optimizer_config", {})),
+        algo_config=algo_config,
+        experiment_dir=experiment_dir,
     )
 
     with ls.tracing_context(project_name="Optim"):
-        prompt, score = await optimizer.optimize_prompt(
+        prompt, score = await optimizer.train(
             task,
-            batch_size=batch_size,
-            train_size=train_size,
-            epochs=epochs,
             annotation_queue=annotation_queue,
-            debug=debug,
             commit_prompts=commit,
         )
     if commit and task.initial_prompt.identifier is not None:
         prompt.push_prompt(
-            identifier=task.initial_prompt.identifier.rsplit(":", maxsplit=1)[0],
             include_model_info=True,
             client=optimizer.client,
         )
 
-    return prompt, score
+    return experiment_dir, config, prompt, score
 
 
 def load_environment():
@@ -170,7 +255,7 @@ def cli():
 @click.option(
     "--epochs",
     type=int,
-    default=2,
+    default=10,
     help="Number of complete passes through the training data. More epochs may improve results but increase runtime.",
 )
 @click.option(
@@ -190,6 +275,13 @@ def cli():
     is_flag=True,
     help="Prevent committing the optimized prompt to the LangChain Hub. Use this for local experimentation.",
 )
+@click.option(
+    "--sweep",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
+    default=None,
+    help="Path to a JSONL file. Each line is a JSON patch for the base config. "
+    "If provided, `train` will loop over each patch, run training, and report results.",
+)
 def train(
     task: str,
     batch_size: int,
@@ -198,25 +290,56 @@ def train(
     debug: bool,
     annotation_queue: Optional[str],
     no_commit: bool,
+    sweep: Optional[str],
 ):
-    """Train and optimize prompts for different tasks."""
-    results = asyncio.run(
-        run(
-            task,
-            batch_size,
-            train_size,
-            epochs,
-            annotation_queue,
-            debug,
-            commit=not no_commit,
-        )
-    )
-    prompt_config, score = results
-    print("Final\n\n")
-    print(prompt_config.get_prompt_str())
-    print("\n\n")
-    print(f"Identifier: {prompt_config.identifier}")
-    print(f"Score: {score}")
+    """Train and optimize prompts for a task.
+    If --sweep is given, run multiple configurations from a JSONL file.
+    """
+    patches = [None]
+    if sweep:
+        with open(sweep, "r", encoding="utf-8") as f:
+            patches = [
+                json.loads(line)
+                for line in f.readlines()
+                if line.strip()
+                and not line.startswith("#")
+                and not line.startswith("//")
+            ]
+
+    def print_results(results: list):
+        print("Best scores:")
+        for _, patch, _, _, score in results:
+            print(f"- Score: {score:.4f} | Patch:\n{json.dumps(patch)}")
+        print("*" * 80)
+
+    async def run_patches(patches: list):
+        results = []
+        for patch in patches:
+            folder, prompt_config, prompt, score = await run(
+                task,
+                batch_size=batch_size,
+                train_size=train_size,
+                epochs=epochs,
+                annotation_queue=annotation_queue,
+                debug=debug,
+                commit=not no_commit,
+                patch=patch,
+            )
+            results.append((folder, patch, prompt_config, prompt, score))
+            if len(results) > 1 and len(results) < len(patches):
+                results = sorted(results, key=lambda x: x[-1], reverse=True)
+                print_results(results)
+
+        return results
+
+    # No sweep: just do the existing single-run logic.
+    results = asyncio.run(run_patches(patches))
+    results = sorted(results, key=lambda x: x[-1], reverse=True)
+    print("Results:")
+    for folder, _, _, prompt, score in results:
+        print(f"- Score: {score:.4f} | {folder}| Prompt:\n{prompt.get_prompt_str()}")
+    if len(results) > 1:
+        print(f"\nBest prompt:\n{results[0][-2].get_prompt_str()}\n\n{results[0][0]}")
 
 
 @cli.group()
@@ -238,7 +361,7 @@ def _try_get_prompt(client: Client, prompt: str | None, yes: bool):
     from langchain_core.prompts.structured import StructuredPrompt
     from langchain_core.runnables import RunnableBinding, RunnableSequence
 
-    from promptim.trainer import PromptWrapper
+    from promptim.types import PromptWrapper
 
     expected_run_outputs = 'predicted: AIMessage = run.outputs["output"]'
     if prompt is None and not yes:
@@ -847,6 +970,23 @@ evaluators = [multiple_lines, no_hashtags, under_180_chars]
 
     with open(os.path.join(path, "task.py"), "w") as f:
         f.write(task_template.strip())
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """
+    Recursively merge `override` into `base`.
+    Values from override have precedence.
+    """
+    merged = copy.deepcopy(base)
+    for k, v in override.items():
+        if v == "DROP":
+            del merged[k]
+            continue
+        if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+            merged[k] = deep_merge(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
 
 
 if __name__ == "__main__":
