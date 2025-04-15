@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Literal
 from datetime import datetime, timezone
 
 import click
@@ -19,22 +19,27 @@ import inspect
 if TYPE_CHECKING:
     from langsmith import Client
 
+TaskType = Literal["scone", "tweet", "metaprompt", "simpleqa", "ticket-classification"]
 
 def get_tasks(task_name: str):
-    from promptim.tasks.metaprompt import metaprompt_task
-    from promptim.tasks.scone import scone_task
-    from promptim.tasks.simpleqa import simpleqa_task
-    from promptim.tasks.ticket_classification import ticket_classification_task
-    from promptim.tasks.tweet_generator import tweet_task
-
-    tasks = {
-        "scone": scone_task,
-        "tweet": tweet_task,
-        "metaprompt": metaprompt_task,
-        "simpleqa": simpleqa_task,
-        "ticket-classification": ticket_classification_task,
-    }
-    return tasks.get(task_name)
+    match task_name:
+        case "scone":
+            from promptim.tasks.scone import scone_task
+            return scone_task
+        case "tweet":
+            from promptim.tasks.tweet_generator import tweet_task
+            return tweet_task
+        case "metaprompt":
+            from promptim.tasks.metaprompt import metaprompt_task
+            return metaprompt_task
+        case "simpleqa":
+            from promptim.tasks.simpleqa import simpleqa_task
+            return simpleqa_task
+        case "ticket-classification":
+            from promptim.tasks.ticket_classification import ticket_classification_task
+            return ticket_classification_task
+        case _:
+            return None
 
 
 def _load_task(name_or_path: str):
